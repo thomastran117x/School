@@ -14,7 +14,10 @@ export REDIS_PORT="${REDIS_PORT:-16379}"
 export OPENSEARCH_PORT="${OPENSEARCH_PORT:-29200}"
 export APP_PORT="${APP_PORT:-13000}"
 
-export DATABASE_URL="mysql://app:app@127.0.0.1:${MYSQL_PORT}/app?ssl-mode=disabled"
+export DATABASE_URL="mysql://app:app@127.0.0.1:${MYSQL_PORT}/app"
+export DATABASE_ACQUIRE_TIMEOUT_MS="2000"
+export DATABASE_QUERY_TIMEOUT_MS="5000"
+export DATABASE_TLS_MODE="disabled"
 export REDIS_URL="redis://127.0.0.1:${REDIS_PORT}"
 export OPENSEARCH_URL="http://127.0.0.1:${OPENSEARCH_PORT}"
 export APP_HOST="127.0.0.1"
@@ -94,6 +97,11 @@ docker compose up \
 echo "Checking the SeaORM migration connection."
 cargo run --locked -p migration -- status
 
+echo "Checking MySQL connectivity, query deadlines, and pool exhaustion."
+cargo test --locked -p backend-api --bin backend-api \
+    infrastructure::database::tests::mysql_pool_enforces_tls_and_timeouts \
+    -- --ignored --exact
+
 echo "Starting the backend API."
 cargo build --locked -p backend-api
 ./target/debug/backend-api >"${API_LOG}" 2>&1 &
@@ -132,6 +140,29 @@ wait_for_status \
     "Redis readiness to recover" \
     120
 grep -q '"redis":"up"' "${RESPONSE_BODY}"
+
+echo "Verifying degraded readiness when MySQL is unavailable."
+docker compose stop mysql
+wait_for_status \
+    "http://127.0.0.1:${APP_PORT}/health/live" \
+    "200" \
+    "liveness to remain available while MySQL is stopped"
+wait_for_status \
+    "http://127.0.0.1:${APP_PORT}/health/ready" \
+    "503" \
+    "MySQL to be reported down"
+grep -q '"mysql":"down"' "${RESPONSE_BODY}"
+grep -q '"redis":"up"' "${RESPONSE_BODY}"
+grep -q '"opensearch":"up"' "${RESPONSE_BODY}"
+
+echo "Verifying readiness recovery after MySQL restarts."
+docker compose start mysql
+wait_for_status \
+    "http://127.0.0.1:${APP_PORT}/health/ready" \
+    "200" \
+    "MySQL readiness to recover" \
+    120
+grep -q '"mysql":"up"' "${RESPONSE_BODY}"
 
 echo "Integration tests passed."
 
