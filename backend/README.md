@@ -98,6 +98,9 @@ Configuration comes from environment variables. For local Cargo runs, `dotenvy` 
 | `HEALTH_CHECK_TIMEOUT_MS` | No | `2000` | Per-dependency readiness timeout |
 | `REFRESH_TOKEN_TTL_SECONDS` | No | `604800` | Lifetime of each refresh token (1 second to 30 days) |
 | `REFRESH_FAMILY_MAX_LIFETIME_SECONDS` | No | `2592000` | Absolute lifetime of a refresh-session family; at least the token TTL, at most 30 days |
+| `COURSE_CACHE_DETAIL_TTL_SECONDS` | No | `300` | Lifetime of a cached course read (1 second to 30 days); also the staleness bound if an invalidation is missed |
+| `COURSE_CACHE_LIST_TTL_SECONDS` | No | `60` | Lifetime of a cached catalogue page; must not exceed the detail TTL |
+| `COURSE_CACHE_NEGATIVE_TTL_SECONDS` | No | `30` | Lifetime of a cached "course not found"; must not exceed the detail TTL |
 | `RUST_LOG` | No | `backend_api=info,tower_http=info` | Tracing filter |
 
 The example environment explicitly disables MySQL TLS only for the localhost/isolated Compose development service. When the mode is omitted, the API and migration CLI require TLS with certificate and hostname verification. `verify_ca` verifies the certificate chain without checking the hostname; `required` encrypts transport without authenticating the server; `preferred` can fall back to plaintext. Configure TLS only through the dedicated variables; `DATABASE_URL` must not contain `ssl-mode` or `ssl-ca`. A supplied CA path must identify a readable file and is accepted only by a verifying mode. If the API runs in a container, mount that file and configure its container path.
@@ -119,6 +122,26 @@ All keys are built with `Key::new(KeyNamespace, id)` as `app:v1:<namespace>:<id>
 | `RefreshToken` | `app:v1:refresh_token:` | `REFRESH_TOKEN_TTL_SECONDS` | One refresh token, keyed by its SHA-256 hash |
 | `RefreshFamily` | `app:v1:refresh_family:` | `REFRESH_FAMILY_MAX_LIFETIME_SECONDS` | Live session family; deleting it revokes the session |
 | `UserSessions` | `app:v1:user_sessions:` | `REFRESH_FAMILY_MAX_LIFETIME_SECONDS` | Set of a user's family ids, used by logout-all |
+| `Course` | `app:v1:course:` | `COURSE_CACHE_*_TTL_SECONDS` | Course catalogue read cache and its invalidation counters |
+
+### Course catalogue cache
+
+`features/courses/cache.rs` provides cache-aside reads for the course catalogue. MySQL is the source of truth; Redis only speeds up display reads and is **never** consulted for authorization or application-acceptance decisions (for example "is this course active and open for applications?"), which must read MySQL directly.
+
+**Read path.** `CourseCache::detail` and `CourseCache::list` look up Redis, and on a miss call the caller's database loader, then fill the cache best-effort. Any Redis failure (unavailable, timeout, undecodable payload) is logged without keys or values and the read falls back to the loader, so a Redis outage degrades performance but not correctness or availability. Loader (database) errors propagate and are never cached. A "course not found" result is cached for the shorter negative TTL.
+
+**Keys** (all in the `Course` namespace, with a payload schema version):
+
+| Key id | TTL | Purpose |
+| --- | --- | --- |
+| `detail.v1.<course_id>` | `COURSE_CACHE_DETAIL_TTL_SECONDS` (`COURSE_CACHE_NEGATIVE_TTL_SECONDS` for not-found) | One course |
+| `list.v1.<generation>.<query hash>` | `COURSE_CACHE_LIST_TTL_SECONDS` | One catalogue page |
+| `ver.v1.<course_id>` | 24 hours | Per-course change counter that guards fills |
+| `gen.v1` | 24 hours | Catalogue generation embedded in listing keys |
+
+**Invalidation.** After the database change commits, writers call `CourseCache::invalidate_course(id)` for any create, update, deactivation, or reactivation. It atomically deletes the detail entry and bumps the course counter and the catalogue generation, which orphans every cached listing page without scanning (orphans expire by TTL). `invalidate_catalogue()` is available for bulk changes. Invalidation is retried once; if Redis is still down, the error is returned and logged, and staleness is bounded by the TTLs above.
+
+**Stale-fill protection.** Readers record the counter before querying MySQL and fill the cache with a Lua script that writes only if the counter is unchanged. A read that overlaps a deactivation therefore cannot re-cache the pre-deactivation row. The scripts assume a single Redis node; a clustered deployment would need hash tags.
 
 ### Refresh sessions
 

@@ -5,5 +5,7 @@
 
 /// Authentication building blocks, starting with the refresh-session store.
 pub(crate) mod auth;
+/// Course catalogue read caching, starting with cache-aside helpers.
+pub(crate) mod courses;
 /// Liveness and datastore-readiness endpoints.
 pub(crate) mod health;
