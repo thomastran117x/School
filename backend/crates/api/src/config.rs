@@ -3,8 +3,9 @@
 //! Values are read once during startup, validated together, and then passed to the
 //! components that need them. A local `.env` file is loaded when present.
 
-use std::{env, net::SocketAddr, str::FromStr, time::Duration};
+use std::{env, net::SocketAddr, path::PathBuf, str::FromStr, time::Duration};
 
+use sea_orm::sqlx::mysql::{MySqlConnectOptions, MySqlSslMode};
 use thiserror::Error;
 use url::Url;
 
@@ -38,6 +39,62 @@ pub struct DatabaseSettings {
     pub max_connections: u32,
     /// Maximum duration allowed when establishing a MySQL connection.
     pub connect_timeout: Duration,
+    /// Maximum duration allowed while waiting for a pooled connection.
+    pub acquire_timeout: Duration,
+    /// Maximum duration allowed for one database operation.
+    pub query_timeout: Duration,
+    /// TLS verification policy applied to MySQL connections.
+    pub tls_mode: DatabaseTlsMode,
+    /// Optional path to an additional PEM-encoded certificate authority bundle.
+    pub tls_ca_path: Option<PathBuf>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// TLS policy used by the MySQL client.
+pub enum DatabaseTlsMode {
+    /// Do not negotiate TLS. This is reserved for the isolated local stack.
+    Disabled,
+    /// Attempt TLS but permit a plaintext fallback.
+    Preferred,
+    /// Require encrypted transport without certificate verification.
+    Required,
+    /// Require TLS and verify the certificate authority.
+    VerifyCa,
+    /// Require TLS and verify both the certificate authority and server hostname.
+    VerifyIdentity,
+}
+
+impl DatabaseTlsMode {
+    /// Converts the validated setting into SQLx's MySQL TLS mode.
+    pub fn as_sqlx(self) -> MySqlSslMode {
+        match self {
+            Self::Disabled => MySqlSslMode::Disabled,
+            Self::Preferred => MySqlSslMode::Preferred,
+            Self::Required => MySqlSslMode::Required,
+            Self::VerifyCa => MySqlSslMode::VerifyCa,
+            Self::VerifyIdentity => MySqlSslMode::VerifyIdentity,
+        }
+    }
+
+    /// Returns whether the mode performs certificate validation.
+    fn verifies_certificate(self) -> bool {
+        matches!(self, Self::VerifyCa | Self::VerifyIdentity)
+    }
+}
+
+impl FromStr for DatabaseTlsMode {
+    type Err = ();
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value.to_ascii_lowercase().as_str() {
+            "disabled" => Ok(Self::Disabled),
+            "preferred" => Ok(Self::Preferred),
+            "required" => Ok(Self::Required),
+            "verify_ca" => Ok(Self::VerifyCa),
+            "verify_identity" => Ok(Self::VerifyIdentity),
+            _ => Err(()),
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -81,7 +138,18 @@ impl Settings {
         let server_host = optional(&get, "APP_HOST", "0.0.0.0");
         let server_port = parse(&get, "APP_PORT", "3000")?;
         let database_url = required(&get, "DATABASE_URL")?;
-        validate_url_scheme("DATABASE_URL", &database_url, &["mysql"])?;
+        let parsed_database_url = validate_url_scheme("DATABASE_URL", &database_url, &["mysql"])?;
+        if parsed_database_url.query_pairs().any(|(key, _)| {
+            matches!(
+                key.to_ascii_lowercase().as_str(),
+                "ssl-mode" | "sslmode" | "ssl-ca" | "sslca"
+            )
+        }) {
+            return Err(ConfigError::DatabaseTlsInUrl);
+        }
+        database_url
+            .parse::<MySqlConnectOptions>()
+            .map_err(|_| ConfigError::InvalidUrl("DATABASE_URL"))?;
 
         let min_connections = parse(&get, "DATABASE_MIN_CONNECTIONS", "0")?;
         let max_connections = parse(&get, "DATABASE_MAX_CONNECTIONS", "10")?;
@@ -108,9 +176,19 @@ impl Settings {
         if health_check_timeout_ms == 0 {
             return Err(ConfigError::ZeroDuration("HEALTH_CHECK_TIMEOUT_MS"));
         }
-        let database_connect_timeout_ms: u64 = parse(&get, "DATABASE_CONNECT_TIMEOUT_MS", "2000")?;
-        if database_connect_timeout_ms == 0 {
-            return Err(ConfigError::ZeroDuration("DATABASE_CONNECT_TIMEOUT_MS"));
+        let database_connect_timeout = duration(&get, "DATABASE_CONNECT_TIMEOUT_MS", "2000")?;
+        let database_acquire_timeout = duration(&get, "DATABASE_ACQUIRE_TIMEOUT_MS", "2000")?;
+        let database_query_timeout = duration(&get, "DATABASE_QUERY_TIMEOUT_MS", "5000")?;
+        let database_tls_mode: DatabaseTlsMode =
+            parse(&get, "DATABASE_TLS_MODE", "verify_identity")?;
+        let database_tls_ca_path = non_empty(get("DATABASE_TLS_CA_PATH")).map(PathBuf::from);
+        if let Some(path) = database_tls_ca_path.as_ref() {
+            if !database_tls_mode.verifies_certificate() {
+                return Err(ConfigError::TlsCaRequiresVerification);
+            }
+            if !path.is_file() || std::fs::File::open(path).is_err() {
+                return Err(ConfigError::InvalidTlsCaPath(path.clone()));
+            }
         }
 
         let settings = Self {
@@ -120,7 +198,11 @@ impl Settings {
                 url: database_url,
                 min_connections,
                 max_connections,
-                connect_timeout: Duration::from_millis(database_connect_timeout_ms),
+                connect_timeout: database_connect_timeout,
+                acquire_timeout: database_acquire_timeout,
+                query_timeout: database_query_timeout,
+                tls_mode: database_tls_mode,
+                tls_ca_path: database_tls_ca_path,
             },
             redis: RedisSettings { url: redis_url },
             opensearch: OpenSearchSettings {
@@ -185,6 +267,19 @@ where
         .map_err(|_| ConfigError::InvalidValue { key, value })
 }
 
+/// Parses a nonzero millisecond duration from a configuration source.
+fn duration(
+    get: &impl Fn(&str) -> Option<String>,
+    key: &'static str,
+    default: &str,
+) -> Result<Duration, ConfigError> {
+    let milliseconds: u64 = parse(get, key, default)?;
+    if milliseconds == 0 {
+        return Err(ConfigError::ZeroDuration(key));
+    }
+    Ok(Duration::from_millis(milliseconds))
+}
+
 /// Parses a URL and restricts it to an explicit set of schemes.
 fn validate_url_scheme(
     key: &'static str,
@@ -226,6 +321,11 @@ pub enum ConfigError {
         /// Human-readable list of accepted URL schemes.
         expected: String,
     },
+    /// The database URL contained TLS settings managed by dedicated variables.
+    #[error(
+        "DATABASE_URL must not contain ssl-mode or ssl-ca; use DATABASE_TLS_MODE and DATABASE_TLS_CA_PATH"
+    )]
+    DatabaseTlsInUrl,
     /// MySQL pool minimum and maximum values were inconsistent.
     #[error(
         "DATABASE_MIN_CONNECTIONS ({min}) cannot exceed DATABASE_MAX_CONNECTIONS ({max}), and the maximum must be greater than zero"
@@ -241,6 +341,12 @@ pub enum ConfigError {
         "OPENSEARCH_USERNAME and OPENSEARCH_PASSWORD must either both be set or both be omitted"
     )]
     IncompleteOpenSearchCredentials,
+    /// A custom CA path was supplied for a TLS mode that does not verify certificates.
+    #[error("DATABASE_TLS_CA_PATH requires DATABASE_TLS_MODE verify_ca or verify_identity")]
+    TlsCaRequiresVerification,
+    /// The configured custom certificate authority path was not a readable file.
+    #[error("DATABASE_TLS_CA_PATH does not identify a readable file: {0:?}")]
+    InvalidTlsCaPath(PathBuf),
     /// A duration setting was configured as zero milliseconds.
     #[error("{0} must be greater than zero")]
     ZeroDuration(&'static str),
@@ -283,6 +389,10 @@ mod tests {
         assert_eq!(loaded.server_address().unwrap().to_string(), "0.0.0.0:3000");
         assert_eq!(loaded.database.min_connections, 0);
         assert_eq!(loaded.database.max_connections, 10);
+        assert_eq!(loaded.database.connect_timeout, Duration::from_secs(2));
+        assert_eq!(loaded.database.acquire_timeout, Duration::from_secs(2));
+        assert_eq!(loaded.database.query_timeout, Duration::from_secs(5));
+        assert_eq!(loaded.database.tls_mode, DatabaseTlsMode::VerifyIdentity);
         assert_eq!(loaded.health_check_timeout, Duration::from_secs(2));
         assert!(loaded.opensearch.username.is_none());
     }
@@ -314,6 +424,20 @@ mod tests {
     }
 
     #[test]
+    fn rejects_database_tls_options_in_the_url() {
+        let mut values = required_values();
+        values[0] = (
+            "DATABASE_URL",
+            "mysql://app:secret@localhost/app?ssl-mode=disabled",
+        );
+
+        assert_eq!(
+            settings(&values).err().unwrap(),
+            ConfigError::DatabaseTlsInUrl
+        );
+    }
+
+    #[test]
     fn rejects_invalid_pool_limits() {
         let mut values = required_values();
         values.extend([
@@ -324,6 +448,60 @@ mod tests {
         assert_eq!(
             settings(&values).err().unwrap(),
             ConfigError::InvalidPoolLimits { min: 11, max: 10 }
+        );
+    }
+
+    #[test]
+    fn loads_explicit_database_tls_and_timeouts() {
+        let mut values = required_values();
+        values.extend([
+            ("DATABASE_TLS_MODE", "required"),
+            ("DATABASE_CONNECT_TIMEOUT_MS", "100"),
+            ("DATABASE_ACQUIRE_TIMEOUT_MS", "200"),
+            ("DATABASE_QUERY_TIMEOUT_MS", "300"),
+        ]);
+
+        let loaded = settings(&values).unwrap();
+
+        assert_eq!(loaded.database.tls_mode, DatabaseTlsMode::Required);
+        assert_eq!(loaded.database.connect_timeout, Duration::from_millis(100));
+        assert_eq!(loaded.database.acquire_timeout, Duration::from_millis(200));
+        assert_eq!(loaded.database.query_timeout, Duration::from_millis(300));
+    }
+
+    #[test]
+    fn rejects_invalid_database_timeout_and_tls_settings() {
+        for key in [
+            "DATABASE_CONNECT_TIMEOUT_MS",
+            "DATABASE_ACQUIRE_TIMEOUT_MS",
+            "DATABASE_QUERY_TIMEOUT_MS",
+        ] {
+            let mut values = required_values();
+            values.push((key, "0"));
+            assert_eq!(
+                settings(&values).err().unwrap(),
+                ConfigError::ZeroDuration(key)
+            );
+        }
+
+        let mut values = required_values();
+        values.push(("DATABASE_TLS_MODE", "sometimes"));
+        assert!(matches!(
+            settings(&values),
+            Err(ConfigError::InvalidValue {
+                key: "DATABASE_TLS_MODE",
+                ..
+            })
+        ));
+
+        let mut values = required_values();
+        values.extend([
+            ("DATABASE_TLS_MODE", "disabled"),
+            ("DATABASE_TLS_CA_PATH", "unused.pem"),
+        ]);
+        assert_eq!(
+            settings(&values).err().unwrap(),
+            ConfigError::TlsCaRequiresVerification
         );
     }
 

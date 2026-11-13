@@ -8,7 +8,7 @@ use std::{fmt::Display, future::Future, time::Duration};
 use async_trait::async_trait;
 
 use super::models::{DependencyStatuses, ReadinessReport};
-use crate::infrastructure::Datastores;
+use crate::infrastructure::{DatabaseClient, DatabaseError, Datastores};
 
 #[derive(Clone)]
 /// Health service that probes MySQL, Redis, and OpenSearch.
@@ -27,8 +27,12 @@ impl DatastoreHealthService {
     }
 
     /// Pings the lazy SeaORM MySQL pool.
-    async fn mysql(&self) -> bool {
-        bounded("mysql", self.timeout, self.datastores.mysql.ping()).await
+    async fn mysql(&self, database: &DatabaseClient) -> bool {
+        let ping = async {
+            let result: Result<(), DatabaseError> = database.ping().await;
+            result
+        };
+        bounded("mysql", self.timeout, ping).await
     }
 
     /// Sends a Redis `PING` through the reconnecting connection manager.
@@ -63,9 +67,9 @@ impl DatastoreHealthService {
 
 #[async_trait]
 impl HealthService for DatastoreHealthService {
-    async fn check(&self) -> ReadinessReport {
+    async fn check(&self, database: &DatabaseClient) -> ReadinessReport {
         let (mysql, redis, opensearch) =
-            tokio::join!(self.mysql(), self.redis(), self.opensearch());
+            tokio::join!(self.mysql(database), self.redis(), self.opensearch());
         ReadinessReport {
             dependencies: DependencyStatuses {
                 mysql: mysql.into(),
@@ -80,7 +84,7 @@ impl HealthService for DatastoreHealthService {
 /// Contract used by health handlers to obtain current dependency readiness.
 pub(crate) trait HealthService: Send + Sync {
     /// Checks every required dependency and returns a sanitized readiness report.
-    async fn check(&self) -> ReadinessReport;
+    async fn check(&self, database: &DatabaseClient) -> ReadinessReport;
 }
 
 /// Runs one dependency check under a timeout and logs operational failure details.

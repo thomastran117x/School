@@ -20,7 +20,7 @@ pub(super) async fn live() -> Json<LivenessResponse> {
 /// The handler returns `200 OK` when all checks pass and `503 Service Unavailable`
 /// with per-dependency state when any check fails or times out.
 pub(super) async fn ready(State(state): State<AppState>) -> Response {
-    let report = state.health.check().await;
+    let report = state.health.check(&state.database).await;
     let status = if report.is_ready() {
         StatusCode::OK
     } else {
@@ -47,22 +47,42 @@ mod tests {
         models::{DependencyState, DependencyStatuses, ReadinessReport},
         service::HealthService,
     };
-    use crate::{app, state::AppState};
+    use crate::{
+        app,
+        config::{DatabaseSettings, DatabaseTlsMode},
+        infrastructure::DatabaseClient,
+        state::AppState,
+    };
 
     #[derive(Clone)]
     struct StubHealthService(ReadinessReport);
 
     #[async_trait]
     impl HealthService for StubHealthService {
-        async fn check(&self) -> ReadinessReport {
+        async fn check(&self, _database: &DatabaseClient) -> ReadinessReport {
             self.0.clone()
         }
     }
 
-    fn state_with(statuses: DependencyStatuses) -> AppState {
-        AppState::new(Arc::new(StubHealthService(ReadinessReport {
-            dependencies: statuses,
-        })))
+    async fn state_with(statuses: DependencyStatuses) -> AppState {
+        let database = DatabaseClient::initialize(&DatabaseSettings {
+            url: "mysql://test:test@localhost/test".to_owned(),
+            min_connections: 0,
+            max_connections: 1,
+            connect_timeout: std::time::Duration::from_secs(1),
+            acquire_timeout: std::time::Duration::from_secs(1),
+            query_timeout: std::time::Duration::from_secs(1),
+            tls_mode: DatabaseTlsMode::Disabled,
+            tls_ca_path: None,
+        })
+        .await
+        .expect("lazy test database should initialize");
+        AppState::new(
+            database,
+            Arc::new(StubHealthService(ReadinessReport {
+                dependencies: statuses,
+            })),
+        )
     }
 
     async fn response_json(response: axum::response::Response) -> Value {
@@ -77,15 +97,16 @@ mod tests {
 
     #[tokio::test]
     async fn liveness_is_independent_of_dependencies() {
-        let response = app::router(state_with(DependencyStatuses::all(DependencyState::Down)))
-            .oneshot(
-                Request::builder()
-                    .uri("/health/live")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
+        let response =
+            app::router(state_with(DependencyStatuses::all(DependencyState::Down)).await)
+                .oneshot(
+                    Request::builder()
+                        .uri("/health/live")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
 
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(response_json(response).await, json!({"status": "ok"}));
@@ -93,7 +114,7 @@ mod tests {
 
     #[tokio::test]
     async fn readiness_succeeds_when_every_dependency_is_up() {
-        let response = app::router(state_with(DependencyStatuses::all(DependencyState::Up)))
+        let response = app::router(state_with(DependencyStatuses::all(DependencyState::Up)).await)
             .oneshot(
                 Request::builder()
                     .uri("/health/ready")
@@ -139,11 +160,14 @@ mod tests {
                 "opensearch",
             ),
         ] {
-            let response = app::router(state_with(DependencyStatuses {
-                mysql,
-                redis,
-                opensearch,
-            }))
+            let response = app::router(
+                state_with(DependencyStatuses {
+                    mysql,
+                    redis,
+                    opensearch,
+                })
+                .await,
+            )
             .oneshot(
                 Request::builder()
                     .uri("/health/ready")

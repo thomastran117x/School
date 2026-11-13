@@ -83,6 +83,10 @@ Configuration comes from environment variables. For local Cargo runs, `dotenvy` 
 | `DATABASE_MIN_CONNECTIONS` | No | `0` | Minimum lazy pool size |
 | `DATABASE_MAX_CONNECTIONS` | No | `10` | Maximum pool size |
 | `DATABASE_CONNECT_TIMEOUT_MS` | No | `2000` | MySQL connection timeout |
+| `DATABASE_ACQUIRE_TIMEOUT_MS` | No | `2000` | Maximum wait for a pooled MySQL connection |
+| `DATABASE_QUERY_TIMEOUT_MS` | No | `5000` | Maximum duration of one bounded database operation |
+| `DATABASE_TLS_MODE` | No | `verify_identity` | MySQL TLS policy: `disabled`, `preferred`, `required`, `verify_ca`, or `verify_identity` |
+| `DATABASE_TLS_CA_PATH` | No | — | Optional additional CA bundle for `verify_ca` or `verify_identity` |
 | `REDIS_URL` | Yes | — | Redis URL (`redis://` or `rediss://`) |
 | `OPENSEARCH_URL` | Yes | — | OpenSearch HTTP(S) endpoint |
 | `OPENSEARCH_USERNAME` | No | — | Optional basic-auth username |
@@ -90,7 +94,9 @@ Configuration comes from environment variables. For local Cargo runs, `dotenvy` 
 | `HEALTH_CHECK_TIMEOUT_MS` | No | `2000` | Per-dependency readiness timeout |
 | `RUST_LOG` | No | `backend_api=info,tower_http=info` | Tracing filter |
 
-The example MySQL URL disables TLS only for the localhost/isolated Compose development service. Use a TLS-enforcing URL for remotely managed or production MySQL.
+The example environment explicitly disables MySQL TLS only for the localhost/isolated Compose development service. When the mode is omitted, the API and migration CLI require TLS with certificate and hostname verification. `verify_ca` verifies the certificate chain without checking the hostname; `required` encrypts transport without authenticating the server; `preferred` can fall back to plaintext. Configure TLS only through the dedicated variables; `DATABASE_URL` must not contain `ssl-mode` or `ssl-ca`. A supplied CA path must identify a readable file and is accepted only by a verifying mode. If the API runs in a container, mount that file and configure its container path.
+
+The API creates one lazy SeaORM pool and shares its cloneable handle through application state. Startup validates the connection URL, TLS policy, pool bounds, and timeout values without contacting MySQL or logging the URL. Database-backed features should run operations through the bounded database client so pool exhaustion and query deadlines become sanitized typed errors rather than raw SQLx or SeaORM failures.
 
 The Compose OpenSearch service disables its security plugin for local development only. Do not expose it to an untrusted network or copy that setting into a production deployment.
 
@@ -105,7 +111,7 @@ cargo run -p migration -- status
 cargo run -p migration -- down
 ```
 
-SeaORM's migration CLI reads `DATABASE_URL` from the environment.
+The migration CLI reads `DATABASE_URL`, `DATABASE_TLS_MODE`, and optional `DATABASE_TLS_CA_PATH` from the environment. It applies the same secure TLS default as the API.
 
 ## Quality checks
 
@@ -126,7 +132,7 @@ The GitHub Actions workflow at `.github/workflows/backend-ci.yml` runs for backe
 3. Unit tests for library and binary targets.
 4. Docker-backed integration tests against MySQL, Redis, and OpenSearch.
 
-The integration suite verifies migration connectivity, liveness, healthy readiness, degraded readiness while Redis is stopped, and automatic recovery after Redis restarts. Run the same suite locally from a Bash-compatible shell:
+The integration suite verifies migrations, required-TLS MySQL connectivity, bounded queries, pool exhaustion, liveness, healthy readiness, degraded readiness while Redis or MySQL is stopped, and automatic recovery after each service restarts. Run the same suite locally from a Bash-compatible shell:
 
 ```bash
 bash scripts/integration-test.sh

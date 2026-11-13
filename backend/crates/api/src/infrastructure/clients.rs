@@ -9,16 +9,16 @@ use opensearch::{
     http::transport::{SingleNodeConnectionPool, TransportBuilder},
 };
 use redis::aio::{ConnectionManager, ConnectionManagerConfig};
-use sea_orm::{ConnectOptions, Database, DatabaseConnection};
 use thiserror::Error;
 
+use super::database::{DatabaseClient, DatabaseInitializationError};
 use crate::config::Settings;
 
 #[derive(Clone)]
 /// Cloneable handles for every datastore used by the backend.
 pub struct Datastores {
     /// Lazy SeaORM connection pool for MySQL.
-    pub mysql: DatabaseConnection,
+    pub mysql: DatabaseClient,
     /// Multiplexed Redis connection manager with automatic reconnection.
     pub redis: ConnectionManager,
     /// Asynchronous client for the configured OpenSearch node.
@@ -36,14 +36,7 @@ impl Datastores {
     /// Returns [`InfrastructureError`] when one of the client configurations cannot be
     /// converted into its underlying library client.
     pub async fn initialize(settings: &Settings) -> Result<Self, InfrastructureError> {
-        let mut mysql_options = ConnectOptions::new(settings.database.url.clone());
-        mysql_options
-            .min_connections(settings.database.min_connections)
-            .max_connections(settings.database.max_connections)
-            .connect_timeout(settings.database.connect_timeout)
-            .connect_lazy(true)
-            .sqlx_logging(false);
-        let mysql = Database::connect(mysql_options).await?;
+        let mysql = DatabaseClient::initialize(&settings.database).await?;
 
         let redis_client = redis::Client::open(settings.redis.url.as_str())?;
         let redis = ConnectionManager::new_lazy_with_config(
@@ -76,7 +69,7 @@ impl Datastores {
 pub enum InfrastructureError {
     /// SeaORM rejected the MySQL connection or pool configuration.
     #[error("MySQL client configuration is invalid")]
-    MySql(#[from] sea_orm::DbErr),
+    MySql(#[from] DatabaseInitializationError),
     /// The Redis client or connection manager configuration was invalid.
     #[error("Redis client configuration is invalid")]
     Redis(#[from] redis::RedisError),
