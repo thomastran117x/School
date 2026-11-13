@@ -87,7 +87,11 @@ Configuration comes from environment variables. For local Cargo runs, `dotenvy` 
 | `DATABASE_QUERY_TIMEOUT_MS` | No | `5000` | Maximum duration of one bounded database operation |
 | `DATABASE_TLS_MODE` | No | `verify_identity` | MySQL TLS policy: `disabled`, `preferred`, `required`, `verify_ca`, or `verify_identity` |
 | `DATABASE_TLS_CA_PATH` | No | — | Optional additional CA bundle for `verify_ca` or `verify_identity` |
-| `REDIS_URL` | Yes | — | Redis URL (`redis://` or `rediss://`) |
+| `REDIS_URL` | Yes | — | Redis URL (`redis://`, or `rediss://` when TLS is enabled); may contain a password |
+| `REDIS_CONNECT_TIMEOUT_MS` | No | `2000` | Redis connection timeout |
+| `REDIS_COMMAND_TIMEOUT_MS` | No | `1000` | Maximum duration of one Redis command, including reconnection |
+| `REDIS_TLS_MODE` | No | `verify` | Redis TLS policy: `disabled`, `required`, or `verify` |
+| `REDIS_TLS_CA_PATH` | No | — | Optional additional CA for `verify` |
 | `OPENSEARCH_URL` | Yes | — | OpenSearch HTTP(S) endpoint |
 | `OPENSEARCH_USERNAME` | No | — | Optional basic-auth username |
 | `OPENSEARCH_PASSWORD` | No | — | Optional basic-auth password; must accompany username |
@@ -97,6 +101,19 @@ Configuration comes from environment variables. For local Cargo runs, `dotenvy` 
 The example environment explicitly disables MySQL TLS only for the localhost/isolated Compose development service. When the mode is omitted, the API and migration CLI require TLS with certificate and hostname verification. `verify_ca` verifies the certificate chain without checking the hostname; `required` encrypts transport without authenticating the server; `preferred` can fall back to plaintext. Configure TLS only through the dedicated variables; `DATABASE_URL` must not contain `ssl-mode` or `ssl-ca`. A supplied CA path must identify a readable file and is accepted only by a verifying mode. If the API runs in a container, mount that file and configure its container path.
 
 The API creates one lazy SeaORM pool and shares its cloneable handle through application state. Startup validates the connection URL, TLS policy, pool bounds, and timeout values without contacting MySQL or logging the URL. Database-backed features should run operations through the bounded database client so pool exhaustion and query deadlines become sanitized typed errors rather than raw SQLx or SeaORM failures.
+
+The API creates one lazy, auto-reconnecting Redis connection manager at startup and shares its cloneable handle through `AppState`. `REDIS_TLS_MODE` defaults to `verify` (certificate and hostname checks, optional custom CA); `required` encrypts without authenticating the server; `disabled` is for the isolated local stack only. `rediss://` must be used exactly when TLS is enabled. Startup validates the URL and TLS settings without contacting Redis or logging the URL. Every command runs through `RedisClient`, so connection, command, and TTL failures become sanitized typed errors (`RedisError`) that never include the URL, password, keys, or values.
+
+### Redis keys and TTLs
+
+All keys are built with `Key::new(KeyNamespace, id)` as `app:v1:<namespace>:<id>`; identifiers are opaque (ASCII alphanumerics, `-`, `_`, `.`, up to 128 bytes) and must never contain secrets or token contents. Bump `v1` to invalidate all stored data after an incompatible format change. Writes use `RedisClient::set_with_ttl`; a TTL is mandatory, at least one second, and at most 30 days.
+
+| Namespace | Prefix | Default TTL | Purpose |
+| --- | --- | --- | --- |
+| `Session` | `app:v1:session:` | 24 hours | Server-side session state |
+| `Cache` | `app:v1:cache:` | 5 minutes | Rebuildable cached data |
+| `RateLimit` | `app:v1:ratelimit:` | 1 minute | Rate-limit counters |
+| `Lock` | `app:v1:lock:` | 30 seconds | Short-lived distributed locks |
 
 The Compose OpenSearch service disables its security plugin for local development only. Do not expose it to an untrusted network or copy that setting into a production deployment.
 

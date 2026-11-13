@@ -18,6 +18,7 @@ export DATABASE_URL="mysql://app:app@127.0.0.1:${MYSQL_PORT}/app"
 export DATABASE_ACQUIRE_TIMEOUT_MS="2000"
 export DATABASE_QUERY_TIMEOUT_MS="5000"
 export DATABASE_TLS_MODE="disabled"
+export REDIS_TLS_MODE="disabled"
 export REDIS_URL="redis://127.0.0.1:${REDIS_PORT}"
 export OPENSEARCH_URL="http://127.0.0.1:${OPENSEARCH_PORT}"
 export APP_HOST="127.0.0.1"
@@ -100,6 +101,11 @@ bash scripts/test-migrations.sh
 echo "Checking MySQL connectivity, query deadlines, and pool exhaustion."
 cargo test --locked -p backend-api --bin backend-api \
     infrastructure::database::tests::mysql_pool_enforces_tls_and_timeouts \
+    -- --ignored --exact
+
+echo "Checking Redis round trips, TTLs, and command deadlines."
+cargo test --locked -p backend-api --bin backend-api \
+    infrastructure::redis::tests::redis_round_trips_values_with_ttl \
     -- --ignored --exact
 
 echo "Starting the backend API."

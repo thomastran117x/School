@@ -8,10 +8,12 @@ use opensearch::{
     auth::Credentials,
     http::transport::{SingleNodeConnectionPool, TransportBuilder},
 };
-use redis::aio::{ConnectionManager, ConnectionManagerConfig};
 use thiserror::Error;
 
-use super::database::{DatabaseClient, DatabaseInitializationError};
+use super::{
+    database::{DatabaseClient, DatabaseInitializationError},
+    redis::{RedisClient, RedisInitializationError},
+};
 use crate::config::Settings;
 
 #[derive(Clone)]
@@ -19,8 +21,8 @@ use crate::config::Settings;
 pub struct Datastores {
     /// Lazy SeaORM connection pool for MySQL.
     pub mysql: DatabaseClient,
-    /// Multiplexed Redis connection manager with automatic reconnection.
-    pub redis: ConnectionManager,
+    /// Bounded, auto-reconnecting Redis client.
+    pub redis: RedisClient,
     /// Asynchronous client for the configured OpenSearch node.
     pub opensearch: OpenSearch,
 }
@@ -38,13 +40,7 @@ impl Datastores {
     pub async fn initialize(settings: &Settings) -> Result<Self, InfrastructureError> {
         let mysql = DatabaseClient::initialize(&settings.database).await?;
 
-        let redis_client = redis::Client::open(settings.redis.url.as_str())?;
-        let redis = ConnectionManager::new_lazy_with_config(
-            redis_client,
-            ConnectionManagerConfig::new()
-                .set_connection_timeout(Some(settings.health_check_timeout))
-                .set_response_timeout(Some(settings.health_check_timeout)),
-        )?;
+        let redis = RedisClient::initialize(&settings.redis).await?;
 
         let pool = SingleNodeConnectionPool::new(settings.opensearch.url.clone());
         let mut transport = TransportBuilder::new(pool);
@@ -72,7 +68,7 @@ pub enum InfrastructureError {
     MySql(#[from] DatabaseInitializationError),
     /// The Redis client or connection manager configuration was invalid.
     #[error("Redis client configuration is invalid")]
-    Redis(#[from] redis::RedisError),
+    Redis(#[from] RedisInitializationError),
     /// The OpenSearch HTTP transport could not be built.
     #[error("OpenSearch client configuration is invalid")]
     OpenSearch(#[from] opensearch::http::transport::BuildError),

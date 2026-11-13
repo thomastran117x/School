@@ -30,11 +30,12 @@ async fn main() -> anyhow::Result<()> {
         .await
         .context("failed to initialize datastore clients")?;
     let database = datastores.mysql.clone();
+    let redis = datastores.redis.clone();
     let health = Arc::new(DatastoreHealthService::new(
         datastores,
         settings.health_check_timeout,
     ));
-    let app = app::router(AppState::new(database, health));
+    let app = app::router(AppState::new(database, redis, health));
 
     let bind_address = settings
         .server_address()
