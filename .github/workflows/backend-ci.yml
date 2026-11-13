@@ -1,0 +1,66 @@
+name: Backend CI
+
+on:
+  pull_request:
+    paths:
+      - "backend/**"
+      - ".github/workflows/backend-ci.yml"
+  push:
+    paths:
+      - "backend/**"
+      - ".github/workflows/backend-ci.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: backend-ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  backend:
+    name: Quality, build, and tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+
+    defaults:
+      run:
+        shell: bash
+        working-directory: backend
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install 1.92.0 --profile minimal
+          rustup component add rustfmt clippy --toolchain 1.92.0
+          rustup default 1.92.0
+          rustc --version
+          cargo --version
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Run Clippy
+        run: cargo clippy --locked --workspace --all-targets -- -D warnings
+
+      - name: Check compilation
+        run: cargo check --locked --workspace --all-targets
+
+      - name: Build workspace
+        run: cargo build --locked --workspace --all-targets
+
+      - name: Run unit tests
+        run: cargo test --locked --workspace --lib --bins
+
+      - name: Prepare OpenSearch host
+        run: sudo sysctl -w vm.max_map_count=262144
+
+      - name: Run integration tests
+        run: bash scripts/integration-test.sh
+
