@@ -117,3 +117,20 @@ cargo doc --workspace --no-deps --document-private-items
 docker compose config --quiet
 ```
 
+## Continuous integration
+
+The GitHub Actions workflow at `.github/workflows/backend-ci.yml` runs for backend changes on pull requests and pushes, and can also be started manually. It performs these gates in order:
+
+1. Rust formatting and strict Clippy checks.
+2. Locked compile checks and a complete workspace build.
+3. Unit tests for library and binary targets.
+4. Docker-backed integration tests against MySQL, Redis, and OpenSearch.
+
+The integration suite verifies migration connectivity, liveness, healthy readiness, degraded readiness while Redis is stopped, and automatic recovery after Redis restarts. Run the same suite locally from a Bash-compatible shell:
+
+```bash
+bash scripts/integration-test.sh
+```
+
+The script uses a unique Compose project name and alternate host ports by default. It always removes its own containers, network, and ephemeral test volumes when complete. Ports and `COMPOSE_PROJECT_NAME` can be overridden through environment variables when necessary.
+
