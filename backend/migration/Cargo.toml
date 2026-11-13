@@ -1,0 +1,21 @@
+[package]
+name = "migration"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[lib]
+name = "migration"
+path = "src/lib.rs"
+
+[[bin]]
+name = "migration"
+path = "src/main.rs"
+
+[dependencies]
+async-trait.workspace = true
+sea-orm-migration.workspace = true
+tokio.workspace = true
+
