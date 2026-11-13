@@ -96,6 +96,8 @@ Configuration comes from environment variables. For local Cargo runs, `dotenvy` 
 | `OPENSEARCH_USERNAME` | No | — | Optional basic-auth username |
 | `OPENSEARCH_PASSWORD` | No | — | Optional basic-auth password; must accompany username |
 | `HEALTH_CHECK_TIMEOUT_MS` | No | `2000` | Per-dependency readiness timeout |
+| `REFRESH_TOKEN_TTL_SECONDS` | No | `604800` | Lifetime of each refresh token (1 second to 30 days) |
+| `REFRESH_FAMILY_MAX_LIFETIME_SECONDS` | No | `2592000` | Absolute lifetime of a refresh-session family; at least the token TTL, at most 30 days |
 | `RUST_LOG` | No | `backend_api=info,tower_http=info` | Tracing filter |
 
 The example environment explicitly disables MySQL TLS only for the localhost/isolated Compose development service. When the mode is omitted, the API and migration CLI require TLS with certificate and hostname verification. `verify_ca` verifies the certificate chain without checking the hostname; `required` encrypts transport without authenticating the server; `preferred` can fall back to plaintext. Configure TLS only through the dedicated variables; `DATABASE_URL` must not contain `ssl-mode` or `ssl-ca`. A supplied CA path must identify a readable file and is accepted only by a verifying mode. If the API runs in a container, mount that file and configure its container path.
@@ -114,6 +116,13 @@ All keys are built with `Key::new(KeyNamespace, id)` as `app:v1:<namespace>:<id>
 | `Cache` | `app:v1:cache:` | 5 minutes | Rebuildable cached data |
 | `RateLimit` | `app:v1:ratelimit:` | 1 minute | Rate-limit counters |
 | `Lock` | `app:v1:lock:` | 30 seconds | Short-lived distributed locks |
+| `RefreshToken` | `app:v1:refresh_token:` | `REFRESH_TOKEN_TTL_SECONDS` | One refresh token, keyed by its SHA-256 hash |
+| `RefreshFamily` | `app:v1:refresh_family:` | `REFRESH_FAMILY_MAX_LIFETIME_SECONDS` | Live session family; deleting it revokes the session |
+| `UserSessions` | `app:v1:user_sessions:` | `REFRESH_FAMILY_MAX_LIFETIME_SECONDS` | Set of a user's family ids, used by logout-all |
+
+### Refresh sessions
+
+The refresh-session store (`features/auth/refresh_store`) issues opaque 256-bit tokens and stores only their SHA-256 hash. Rotation, logout, and logout-all each run as one Lua script, so concurrent use of the same token yields at most one successor. Presenting an already-rotated token revokes its whole session family. The scripts derive family keys from stored ids, which assumes a single Redis node; a clustered deployment needs hash tags. Every Redis failure surfaces as `RefreshStoreError::Unavailable`, which callers must treat as a denial (fail closed).
 
 The Compose OpenSearch service disables its security plugin for local development only. Do not expose it to an untrusted network or copy that setting into a production deployment.
 

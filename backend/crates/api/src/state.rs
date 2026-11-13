@@ -6,7 +6,7 @@
 use std::sync::Arc;
 
 use crate::{
-    features::health::HealthService,
+    features::{auth::refresh_store::RefreshSessionStore, health::HealthService},
     infrastructure::{DatabaseClient, RedisClient},
 };
 
@@ -20,6 +20,9 @@ pub struct AppState {
     pub redis: RedisClient,
     /// Health service used by liveness and readiness handlers.
     pub health: Arc<dyn HealthService>,
+    /// Refresh-session store consumed by the authentication endpoints.
+    #[allow(dead_code)] // Consumed by AUTH-07.
+    pub refresh_sessions: Arc<dyn RefreshSessionStore>,
 }
 
 impl AppState {
@@ -28,11 +31,13 @@ impl AppState {
         database: DatabaseClient,
         redis: RedisClient,
         health: Arc<dyn HealthService>,
+        refresh_sessions: Arc<dyn RefreshSessionStore>,
     ) -> Self {
         Self {
             database,
             redis,
             health,
+            refresh_sessions,
         }
     }
 }

@@ -49,7 +49,8 @@ mod tests {
     };
     use crate::{
         app,
-        config::{DatabaseSettings, DatabaseTlsMode, RedisSettings, RedisTlsMode},
+        config::{AuthSettings, DatabaseSettings, DatabaseTlsMode, RedisSettings, RedisTlsMode},
+        features::auth::refresh_store::RedisRefreshSessionStore,
         infrastructure::{DatabaseClient, RedisClient},
         state::AppState,
     };
@@ -86,12 +87,20 @@ mod tests {
         })
         .await
         .expect("lazy test redis client should initialize");
+        let refresh_sessions = Arc::new(RedisRefreshSessionStore::new(
+            redis.clone(),
+            AuthSettings {
+                refresh_token_ttl: std::time::Duration::from_secs(60),
+                refresh_family_max_lifetime: std::time::Duration::from_secs(120),
+            },
+        ));
         AppState::new(
             database,
             redis,
             Arc::new(StubHealthService(ReadinessReport {
                 dependencies: statuses,
             })),
+            refresh_sessions,
         )
     }
 

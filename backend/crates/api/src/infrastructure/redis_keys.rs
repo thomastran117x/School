@@ -30,6 +30,12 @@ pub enum KeyNamespace {
     RateLimit,
     /// Short-lived distributed locks. Default TTL: 30 seconds.
     Lock,
+    /// One refresh token, identified by its SHA-256 hash. Default TTL: 7 days.
+    RefreshToken,
+    /// One refresh-session family. Default TTL: 30 days.
+    RefreshFamily,
+    /// Index of a user's refresh-session families. Default TTL: 30 days.
+    UserSessions,
 }
 
 impl KeyNamespace {
@@ -40,6 +46,9 @@ impl KeyNamespace {
             Self::Cache => "cache",
             Self::RateLimit => "ratelimit",
             Self::Lock => "lock",
+            Self::RefreshToken => "refresh_token",
+            Self::RefreshFamily => "refresh_family",
+            Self::UserSessions => "user_sessions",
         }
     }
 
@@ -50,6 +59,8 @@ impl KeyNamespace {
             Self::Cache => Duration::from_secs(5 * 60),
             Self::RateLimit => Duration::from_secs(60),
             Self::Lock => Duration::from_secs(30),
+            Self::RefreshToken => Duration::from_secs(7 * 24 * 60 * 60),
+            Self::RefreshFamily | Self::UserSessions => Duration::from_secs(30 * 24 * 60 * 60),
         }
     }
 }
@@ -78,6 +89,13 @@ impl Key {
             return Err(KeyError::InvalidId);
         }
         Ok(Self(format!("{ROOT_PREFIX}:{}:{id}", namespace.prefix())))
+    }
+
+    /// Returns the prefix shared by every key in `namespace`, including the trailing `:`.
+    ///
+    /// Intended for server-side scripts that derive sibling keys from stored ids.
+    pub fn namespace_prefix(namespace: KeyNamespace) -> String {
+        format!("{ROOT_PREFIX}:{}:", namespace.prefix())
     }
 
     /// Returns the key as sent to Redis.
@@ -128,6 +146,9 @@ mod tests {
             KeyNamespace::Cache,
             KeyNamespace::RateLimit,
             KeyNamespace::Lock,
+            KeyNamespace::RefreshToken,
+            KeyNamespace::RefreshFamily,
+            KeyNamespace::UserSessions,
         ] {
             assert!(namespace.default_ttl() > Duration::ZERO);
             assert!(namespace.default_ttl() <= MAX_TTL);
