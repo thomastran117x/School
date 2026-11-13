@@ -102,6 +102,11 @@ cargo test --locked -p backend-api --bin backend-api \
     infrastructure::database::tests::mysql_pool_enforces_tls_and_timeouts \
     -- --ignored --exact
 
+echo "Checking application repository transactions and concurrency."
+cargo test --locked -p backend-api --bin backend-api \
+    features::applications::repository::tests::mysql_repository_enforces_transactions_and_concurrency \
+    -- --ignored --exact
+
 echo "Starting the backend API."
 cargo build --locked -p backend-api
 ./target/debug/backend-api >"${API_LOG}" 2>&1 &

@@ -139,6 +139,16 @@ The migration contract test uses the isolated Compose database to exercise clean
 bash scripts/test-migrations.sh
 ```
 
+## Persistence and transactions
+
+Feature-owned repositories use the shared `DatabaseClient` rather than creating pools or bypassing configured timeouts. SQL values are always passed through SeaORM statement parameters; repository code must not construct SQL by interpolating request or domain values.
+
+`DatabaseClient::run_transaction` bounds an entire read-write transaction with the configured query timeout and rolls back when either the database or the feature operation returns an error. Application submission locks the course while checking active state and deadline, then relies on the unique student-course constraint as the authoritative duplicate guard.
+
+An application decision locks the pending application before changing it. Acceptances also lock the course and perform a current locking read of accepted applications before comparing against capacity. This serializes last-seat decisions even under MySQL repeatable-read isolation. All future code that changes course capacity must update the same course row within its transaction so it participates in this locking convention. Application status and its final review are written in one transaction; failure of either write rolls both back.
+
+Repositories expose domain outcomes such as duplicate application, invalid transition, and full capacity. SQL, connection URLs, driver messages, and credentials remain in internal error sources and are never used as client-facing messages.
+
 ## Quality checks
 
 ```powershell
@@ -159,7 +169,7 @@ The GitHub Actions workflow at `.github/workflows/backend-ci.yml` runs for backe
 4. Docker-backed migration and integration tests against clean MySQL, Redis, and OpenSearch services.
 5. A production image build and smoke test of its packaged migration CLI.
 
-The integration suite applies, rolls back, and reapplies migrations while checking schema constraints, then verifies required-TLS MySQL connectivity, bounded queries, pool exhaustion, liveness, healthy readiness, degraded readiness while Redis or MySQL is stopped, and automatic recovery after each service restarts. Run the same suite locally from a Bash-compatible shell:
+The integration suite applies, rolls back, and reapplies migrations while checking schema constraints, verifies transactional application submission and concurrent review decisions, then checks required-TLS MySQL connectivity, bounded queries, pool exhaustion, liveness, healthy readiness, degraded readiness while Redis or MySQL is stopped, and automatic recovery after each service restarts. Run the same suite locally from a Bash-compatible shell:
 
 ```bash
 bash scripts/integration-test.sh

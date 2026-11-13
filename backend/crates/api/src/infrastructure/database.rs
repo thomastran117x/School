@@ -4,14 +4,18 @@
 //! SeaORM operations through [`DatabaseClient::run`] so acquisition failures and
 //! query deadlines have one sanitized error contract.
 
-use std::{future::Future, pin::Pin, time::Duration};
+use std::{fmt, future::Future, pin::Pin, time::Duration};
 
-use sea_orm::{ConnAcquireErr, ConnectOptions, Database, DatabaseConnection, DbErr};
+use sea_orm::{
+    AccessMode, ConnAcquireErr, ConnectOptions, Database, DatabaseConnection, DatabaseTransaction,
+    DbErr, IsolationLevel, TransactionError, TransactionTrait,
+};
 use thiserror::Error;
 
 use crate::config::DatabaseSettings;
 
 type DatabaseFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T, DbErr>> + Send + 'a>>;
+type TransactionFuture<'a, T, E> = Pin<Box<dyn Future<Output = Result<T, E>> + Send + 'a>>;
 
 #[derive(Clone)]
 /// Cloneable access to the application's single SeaORM MySQL pool.
@@ -81,6 +85,43 @@ impl DatabaseClient {
         }
     }
 
+    /// Runs one read-write transaction within the configured query deadline.
+    ///
+    /// The transaction uses MySQL's repeatable-read isolation. Returning a domain
+    /// error from `operation`, encountering a database error, or exceeding the
+    /// deadline rolls the transaction back. Database failures are converted to the
+    /// caller's error type through [`From<DatabaseError>`].
+    ///
+    /// # Errors
+    ///
+    /// Returns the operation's domain error or a sanitized database failure
+    /// converted into that error type.
+    #[allow(
+        dead_code,
+        reason = "the transaction API is consumed by the staged application repository"
+    )]
+    pub async fn run_transaction<T, E, F>(&self, operation: F) -> Result<T, E>
+    where
+        T: Send,
+        E: From<DatabaseError> + fmt::Debug + fmt::Display + Send,
+        F: for<'a> FnOnce(&'a DatabaseTransaction) -> TransactionFuture<'a, T, E> + Send,
+    {
+        let transaction = self.connection.transaction_with_config(
+            operation,
+            Some(IsolationLevel::RepeatableRead),
+            Some(AccessMode::ReadWrite),
+        );
+
+        match tokio::time::timeout(self.query_timeout, transaction).await {
+            Ok(Ok(value)) => Ok(value),
+            Ok(Err(TransactionError::Connection(error))) => {
+                Err(DatabaseError::from_db_error(error).into())
+            }
+            Ok(Err(TransactionError::Transaction(error))) => Err(error),
+            Err(_) => Err(DatabaseError::QueryTimedOut.into()),
+        }
+    }
+
     /// Checks whether the pool can acquire a live MySQL connection.
     ///
     /// # Errors
@@ -115,7 +156,7 @@ pub enum DatabaseError {
 
 impl DatabaseError {
     /// Classifies a SeaORM error without exposing its message through `Display`.
-    fn from_db_error(error: DbErr) -> Self {
+    pub(crate) fn from_db_error(error: DbErr) -> Self {
         match error {
             DbErr::ConnectionAcquire(ConnAcquireErr::Timeout) => Self::PoolExhausted,
             DbErr::ConnectionAcquire(ConnAcquireErr::ConnectionClosed) | DbErr::Conn(_) => {
