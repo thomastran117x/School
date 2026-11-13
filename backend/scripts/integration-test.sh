@@ -113,6 +113,11 @@ cargo test --locked -p backend-api --bin backend-api \
     features::auth::refresh_store::service::tests::integration:: \
     -- --ignored
 
+echo "Checking course cache-aside reads, invalidation, and stale-fill protection."
+cargo test --locked -p backend-api --bin backend-api \
+    features::courses::cache::tests::integration:: \
+    -- --ignored
+
 echo "Starting the backend API."
 cargo build --locked -p backend-api
 ./target/debug/backend-api >"${API_LOG}" 2>&1 &

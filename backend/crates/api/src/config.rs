@@ -24,6 +24,10 @@ pub struct Settings {
     pub opensearch: OpenSearchSettings,
     /// Refresh-session lifetime settings.
     pub auth: AuthSettings,
+    /// Course catalogue cache lifetimes.
+    // Consumed once the catalogue read service constructs its `CourseCache`.
+    #[allow(dead_code)]
+    pub course_cache: CourseCacheSettings,
     /// Maximum duration allowed for each dependency readiness probe.
     pub health_check_timeout: Duration,
     /// [`tracing_subscriber::EnvFilter`] expression used by application telemetry.
@@ -37,6 +41,28 @@ pub struct AuthSettings {
     pub refresh_token_ttl: Duration,
     /// Absolute lifetime of a session family, regardless of how often it rotates.
     pub refresh_family_max_lifetime: Duration,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+/// Lifetimes for the course catalogue cache. They bound how stale a cached read can be
+/// when an invalidation is missed (for example because Redis was unreachable).
+pub struct CourseCacheSettings {
+    /// Lifetime of a cached single-course read.
+    pub detail_ttl: Duration,
+    /// Lifetime of a cached catalogue listing page.
+    pub list_ttl: Duration,
+    /// Lifetime of a cached "course not found" result.
+    pub negative_ttl: Duration,
+}
+
+impl Default for CourseCacheSettings {
+    fn default() -> Self {
+        Self {
+            detail_ttl: Duration::from_secs(300),
+            list_ttl: Duration::from_secs(60),
+            negative_ttl: Duration::from_secs(30),
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -258,6 +284,17 @@ impl Settings {
             return Err(ConfigError::InvalidAuthLifetimes);
         }
 
+        let course_cache = CourseCacheSettings {
+            detail_ttl: seconds(&get, "COURSE_CACHE_DETAIL_TTL_SECONDS", "300")?,
+            list_ttl: seconds(&get, "COURSE_CACHE_LIST_TTL_SECONDS", "60")?,
+            negative_ttl: seconds(&get, "COURSE_CACHE_NEGATIVE_TTL_SECONDS", "30")?,
+        };
+        if course_cache.list_ttl > course_cache.detail_ttl
+            || course_cache.negative_ttl > course_cache.detail_ttl
+        {
+            return Err(ConfigError::InvalidCourseCacheTtls);
+        }
+
         let settings = Self {
             server_host,
             server_port,
@@ -287,6 +324,7 @@ impl Settings {
                 refresh_token_ttl,
                 refresh_family_max_lifetime,
             },
+            course_cache,
             health_check_timeout: Duration::from_millis(health_check_timeout_ms),
             log_filter: optional(&get, "RUST_LOG", "backend_api=info,tower_http=info"),
         };
@@ -459,6 +497,11 @@ pub enum ConfigError {
     /// The refresh family lifetime was shorter than the refresh token lifetime.
     #[error("REFRESH_FAMILY_MAX_LIFETIME_SECONDS must be at least REFRESH_TOKEN_TTL_SECONDS")]
     InvalidAuthLifetimes,
+    /// The list or negative cache TTL exceeded the detail cache TTL.
+    #[error(
+        "COURSE_CACHE_LIST_TTL_SECONDS and COURSE_CACHE_NEGATIVE_TTL_SECONDS must not exceed COURSE_CACHE_DETAIL_TTL_SECONDS"
+    )]
+    InvalidCourseCacheTtls,
     /// The configured HTTP host and port did not form a valid socket address.
     #[error("APP_HOST {host:?} and APP_PORT {port} do not form a valid socket address")]
     InvalidSocketAddress {
@@ -539,6 +582,33 @@ mod tests {
                 ("REFRESH_FAMILY_MAX_LIFETIME_SECONDS", "50"),
             ]),
             Some(ConfigError::InvalidAuthLifetimes)
+        );
+    }
+
+    #[test]
+    fn loads_and_validates_course_cache_ttls() {
+        let loaded = settings(&required_values()).unwrap();
+        assert_eq!(loaded.course_cache, CourseCacheSettings::default());
+
+        let with = |extra: &[(&'static str, &'static str)]| {
+            let mut values = required_values();
+            values.extend_from_slice(extra);
+            settings(&values).err()
+        };
+        assert_eq!(
+            with(&[("COURSE_CACHE_LIST_TTL_SECONDS", "0")]),
+            Some(ConfigError::ZeroDuration("COURSE_CACHE_LIST_TTL_SECONDS"))
+        );
+        assert_eq!(
+            with(&[("COURSE_CACHE_DETAIL_TTL_SECONDS", "99999999")]),
+            Some(ConfigError::InvalidValue {
+                key: "COURSE_CACHE_DETAIL_TTL_SECONDS",
+                value: "99999999".to_owned()
+            })
+        );
+        assert_eq!(
+            with(&[("COURSE_CACHE_LIST_TTL_SECONDS", "301")]),
+            Some(ConfigError::InvalidCourseCacheTtls)
         );
     }
 

@@ -36,6 +36,8 @@ pub enum KeyNamespace {
     RefreshFamily,
     /// Index of a user's refresh-session families. Default TTL: 30 days.
     UserSessions,
+    /// Course catalogue read cache and its invalidation counters. Default TTL: 5 minutes.
+    Course,
 }
 
 impl KeyNamespace {
@@ -49,6 +51,7 @@ impl KeyNamespace {
             Self::RefreshToken => "refresh_token",
             Self::RefreshFamily => "refresh_family",
             Self::UserSessions => "user_sessions",
+            Self::Course => "course",
         }
     }
 
@@ -56,7 +59,7 @@ impl KeyNamespace {
     pub const fn default_ttl(self) -> Duration {
         match self {
             Self::Session => Duration::from_secs(24 * 60 * 60),
-            Self::Cache => Duration::from_secs(5 * 60),
+            Self::Cache | Self::Course => Duration::from_secs(5 * 60),
             Self::RateLimit => Duration::from_secs(60),
             Self::Lock => Duration::from_secs(30),
             Self::RefreshToken => Duration::from_secs(7 * 24 * 60 * 60),
@@ -149,6 +152,7 @@ mod tests {
             KeyNamespace::RefreshToken,
             KeyNamespace::RefreshFamily,
             KeyNamespace::UserSessions,
+            KeyNamespace::Course,
         ] {
             assert!(namespace.default_ttl() > Duration::ZERO);
             assert!(namespace.default_ttl() <= MAX_TTL);
