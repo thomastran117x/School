@@ -22,10 +22,21 @@ pub struct Settings {
     pub redis: RedisSettings,
     /// OpenSearch client and authentication settings.
     pub opensearch: OpenSearchSettings,
+    /// Refresh-session lifetime settings.
+    pub auth: AuthSettings,
     /// Maximum duration allowed for each dependency readiness probe.
     pub health_check_timeout: Duration,
     /// [`tracing_subscriber::EnvFilter`] expression used by application telemetry.
     pub log_filter: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+/// Lifetime settings for the refresh-session store.
+pub struct AuthSettings {
+    /// Lifetime of each individual refresh token.
+    pub refresh_token_ttl: Duration,
+    /// Absolute lifetime of a session family, regardless of how often it rotates.
+    pub refresh_family_max_lifetime: Duration,
 }
 
 #[derive(Clone)]
@@ -240,6 +251,13 @@ impl Settings {
             }
         }
 
+        let refresh_token_ttl = seconds(&get, "REFRESH_TOKEN_TTL_SECONDS", "604800")?;
+        let refresh_family_max_lifetime =
+            seconds(&get, "REFRESH_FAMILY_MAX_LIFETIME_SECONDS", "2592000")?;
+        if refresh_family_max_lifetime < refresh_token_ttl {
+            return Err(ConfigError::InvalidAuthLifetimes);
+        }
+
         let settings = Self {
             server_host,
             server_port,
@@ -264,6 +282,10 @@ impl Settings {
                 url: opensearch_url,
                 username,
                 password,
+            },
+            auth: AuthSettings {
+                refresh_token_ttl,
+                refresh_family_max_lifetime,
             },
             health_check_timeout: Duration::from_millis(health_check_timeout_ms),
             log_filter: optional(&get, "RUST_LOG", "backend_api=info,tower_http=info"),
@@ -333,6 +355,26 @@ fn duration(
         return Err(ConfigError::ZeroDuration(key));
     }
     Ok(Duration::from_millis(milliseconds))
+}
+
+/// Parses a nonzero second duration no longer than the maximum Redis TTL.
+fn seconds(
+    get: &impl Fn(&str) -> Option<String>,
+    key: &'static str,
+    default: &str,
+) -> Result<Duration, ConfigError> {
+    let seconds: u64 = parse(get, key, default)?;
+    if seconds == 0 {
+        return Err(ConfigError::ZeroDuration(key));
+    }
+    let value = Duration::from_secs(seconds);
+    if value > crate::infrastructure::MAX_TTL {
+        return Err(ConfigError::InvalidValue {
+            key,
+            value: seconds.to_string(),
+        });
+    }
+    Ok(value)
 }
 
 /// Parses a URL and restricts it to an explicit set of schemes.
@@ -414,6 +456,9 @@ pub enum ConfigError {
     /// A duration setting was configured as zero milliseconds.
     #[error("{0} must be greater than zero")]
     ZeroDuration(&'static str),
+    /// The refresh family lifetime was shorter than the refresh token lifetime.
+    #[error("REFRESH_FAMILY_MAX_LIFETIME_SECONDS must be at least REFRESH_TOKEN_TTL_SECONDS")]
+    InvalidAuthLifetimes,
     /// The configured HTTP host and port did not form a valid socket address.
     #[error("APP_HOST {host:?} and APP_PORT {port} do not form a valid socket address")]
     InvalidSocketAddress {
@@ -459,6 +504,42 @@ mod tests {
         assert_eq!(loaded.database.tls_mode, DatabaseTlsMode::VerifyIdentity);
         assert_eq!(loaded.health_check_timeout, Duration::from_secs(2));
         assert!(loaded.opensearch.username.is_none());
+        assert_eq!(
+            loaded.auth.refresh_token_ttl,
+            Duration::from_secs(7 * 24 * 60 * 60)
+        );
+        assert_eq!(
+            loaded.auth.refresh_family_max_lifetime,
+            Duration::from_secs(30 * 24 * 60 * 60)
+        );
+    }
+
+    #[test]
+    fn validates_refresh_lifetimes() {
+        let with = |extra: &[(&'static str, &'static str)]| {
+            let mut values = required_values();
+            values.extend_from_slice(extra);
+            settings(&values).err()
+        };
+
+        assert_eq!(
+            with(&[("REFRESH_TOKEN_TTL_SECONDS", "0")]),
+            Some(ConfigError::ZeroDuration("REFRESH_TOKEN_TTL_SECONDS"))
+        );
+        assert_eq!(
+            with(&[("REFRESH_FAMILY_MAX_LIFETIME_SECONDS", "99999999")]),
+            Some(ConfigError::InvalidValue {
+                key: "REFRESH_FAMILY_MAX_LIFETIME_SECONDS",
+                value: "99999999".to_owned()
+            })
+        );
+        assert_eq!(
+            with(&[
+                ("REFRESH_TOKEN_TTL_SECONDS", "100"),
+                ("REFRESH_FAMILY_MAX_LIFETIME_SECONDS", "50"),
+            ]),
+            Some(ConfigError::InvalidAuthLifetimes)
+        );
     }
 
     #[test]

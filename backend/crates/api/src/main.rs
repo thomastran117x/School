@@ -16,7 +16,7 @@ mod telemetry;
 use std::sync::Arc;
 
 use anyhow::Context;
-use features::health::DatastoreHealthService;
+use features::{auth::refresh_store::RedisRefreshSessionStore, health::DatastoreHealthService};
 use infrastructure::Datastores;
 use state::AppState;
 
@@ -31,11 +31,15 @@ async fn main() -> anyhow::Result<()> {
         .context("failed to initialize datastore clients")?;
     let database = datastores.mysql.clone();
     let redis = datastores.redis.clone();
+    let refresh_sessions = Arc::new(RedisRefreshSessionStore::new(
+        redis.clone(),
+        settings.auth.clone(),
+    ));
     let health = Arc::new(DatastoreHealthService::new(
         datastores,
         settings.health_check_timeout,
     ));
-    let app = app::router(AppState::new(database, redis, health));
+    let app = app::router(AppState::new(database, redis, health, refresh_sessions));
 
     let bind_address = settings
         .server_address()
