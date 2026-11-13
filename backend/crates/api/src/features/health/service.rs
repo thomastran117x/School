@@ -1,3 +1,8 @@
+//! Readiness service and external dependency probes.
+//!
+//! All probes run concurrently and are bounded independently so one slow datastore
+//! cannot delay the response beyond the configured timeout.
+
 use std::{fmt::Display, future::Future, time::Duration};
 
 use async_trait::async_trait;
@@ -6,12 +11,14 @@ use super::models::{DependencyStatuses, ReadinessReport};
 use crate::infrastructure::Datastores;
 
 #[derive(Clone)]
+/// Health service that probes MySQL, Redis, and OpenSearch.
 pub(crate) struct DatastoreHealthService {
     datastores: Datastores,
     timeout: Duration,
 }
 
 impl DatastoreHealthService {
+    /// Creates a health service using shared datastore clients and a per-probe timeout.
     pub fn new(datastores: Datastores, timeout: Duration) -> Self {
         Self {
             datastores,
@@ -19,10 +26,12 @@ impl DatastoreHealthService {
         }
     }
 
+    /// Pings the lazy SeaORM MySQL pool.
     async fn mysql(&self) -> bool {
         bounded("mysql", self.timeout, self.datastores.mysql.ping()).await
     }
 
+    /// Sends a Redis `PING` through the reconnecting connection manager.
     async fn redis(&self) -> bool {
         let mut connection = self.datastores.redis.clone();
         let ping = async move {
@@ -32,6 +41,7 @@ impl DatastoreHealthService {
         bounded("redis", self.timeout, ping).await
     }
 
+    /// Sends an OpenSearch ping request and accepts only successful HTTP responses.
     async fn opensearch(&self) -> bool {
         let ping = async {
             let response = self
@@ -67,10 +77,13 @@ impl HealthService for DatastoreHealthService {
 }
 
 #[async_trait]
+/// Contract used by health handlers to obtain current dependency readiness.
 pub(crate) trait HealthService: Send + Sync {
+    /// Checks every required dependency and returns a sanitized readiness report.
     async fn check(&self) -> ReadinessReport;
 }
 
+/// Runs one dependency check under a timeout and logs operational failure details.
 async fn bounded<T, E>(
     service: &'static str,
     timeout: Duration,

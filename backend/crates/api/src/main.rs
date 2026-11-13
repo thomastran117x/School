@@ -1,3 +1,10 @@
+//! Backend API executable.
+//!
+//! This crate wires configuration, shared infrastructure, feature services, HTTP
+//! routing, telemetry, and graceful shutdown into one Axum server process.
+#![warn(missing_docs)]
+#![warn(rustdoc::broken_intra_doc_links)]
+
 mod app;
 mod config;
 mod features;
@@ -14,6 +21,7 @@ use infrastructure::Datastores;
 use state::AppState;
 
 #[tokio::main]
+/// Loads the application and serves HTTP requests until a shutdown signal arrives.
 async fn main() -> anyhow::Result<()> {
     let settings = config::Settings::from_env().context("failed to load configuration")?;
     telemetry::init(&settings.log_filter).context("failed to initialize tracing")?;

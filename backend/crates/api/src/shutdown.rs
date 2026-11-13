@@ -1,3 +1,9 @@
+//! Operating-system shutdown signal handling.
+
+/// Waits for Ctrl+C on every platform or SIGTERM on Unix.
+///
+/// The returned future completes once one supported signal is received, allowing
+/// Axum to stop accepting new connections and finish in-flight requests.
 pub async fn signal() {
     let ctrl_c = async {
         tokio::signal::ctrl_c()

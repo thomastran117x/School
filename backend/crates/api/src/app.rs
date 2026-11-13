@@ -1,3 +1,8 @@
+//! Top-level HTTP application composition.
+//!
+//! Feature routers are mounted here alongside middleware that applies uniformly to
+//! the entire API.
+
 use axum::{Router, http::HeaderName};
 use tower_http::{
     request_id::{MakeRequestUuid, PropagateRequestIdLayer, SetRequestIdLayer},
@@ -6,6 +11,10 @@ use tower_http::{
 
 use crate::{features, state::AppState};
 
+/// Builds the complete Axum router with application state and shared middleware.
+///
+/// Every request receives an `x-request-id` header unless it already has one, and
+/// HTTP spans are emitted through [`TraceLayer`].
 pub fn router(state: AppState) -> Router {
     let request_id_header = HeaderName::from_static("x-request-id");
 

@@ -1,3 +1,5 @@
+//! HTTP handlers for the health feature.
+
 use axum::{
     Json,
     extract::State,
@@ -8,10 +10,15 @@ use axum::{
 use super::models::{LivenessResponse, ReadinessResponse};
 use crate::state::AppState;
 
+/// Reports whether the HTTP process is alive and able to serve requests.
 pub(super) async fn live() -> Json<LivenessResponse> {
     Json(LivenessResponse { status: "ok" })
 }
 
+/// Reports whether every required external dependency is currently reachable.
+///
+/// The handler returns `200 OK` when all checks pass and `503 Service Unavailable`
+/// with per-dependency state when any check fails or times out.
 pub(super) async fn ready(State(state): State<AppState>) -> Response {
     let report = state.health.check().await;
     let status = if report.is_ready() {

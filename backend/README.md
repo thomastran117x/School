@@ -113,6 +113,7 @@ SeaORM's migration CLI reads `DATABASE_URL` from the environment.
 cargo fmt --all --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
+cargo doc --workspace --no-deps --document-private-items
 docker compose config --quiet
 ```
 

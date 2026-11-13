@@ -1,45 +1,82 @@
+//! Environment-backed application configuration.
+//!
+//! Values are read once during startup, validated together, and then passed to the
+//! components that need them. A local `.env` file is loaded when present.
+
 use std::{env, net::SocketAddr, str::FromStr, time::Duration};
 
 use thiserror::Error;
 use url::Url;
 
 #[derive(Clone)]
+/// Validated settings for the complete API process.
 pub struct Settings {
+    /// Interface or IP address on which the HTTP server listens.
     pub server_host: String,
+    /// TCP port on which the HTTP server listens.
     pub server_port: u16,
+    /// MySQL and SeaORM pool settings.
     pub database: DatabaseSettings,
+    /// Redis client settings.
     pub redis: RedisSettings,
+    /// OpenSearch client and authentication settings.
     pub opensearch: OpenSearchSettings,
+    /// Maximum duration allowed for each dependency readiness probe.
     pub health_check_timeout: Duration,
+    /// [`tracing_subscriber::EnvFilter`] expression used by application telemetry.
     pub log_filter: String,
 }
 
 #[derive(Clone)]
+/// MySQL connection and pool configuration used by SeaORM.
 pub struct DatabaseSettings {
+    /// MySQL connection URL, including credentials and database name.
     pub url: String,
+    /// Minimum number of connections retained by the pool.
     pub min_connections: u32,
+    /// Maximum number of connections allowed in the pool.
     pub max_connections: u32,
+    /// Maximum duration allowed when establishing a MySQL connection.
     pub connect_timeout: Duration,
 }
 
 #[derive(Clone)]
+/// Redis connection configuration.
 pub struct RedisSettings {
+    /// Redis connection URL using the `redis` or `rediss` scheme.
     pub url: String,
 }
 
 #[derive(Clone)]
+/// OpenSearch endpoint and optional basic-auth credentials.
 pub struct OpenSearchSettings {
+    /// Base HTTP(S) URL for the OpenSearch node.
     pub url: Url,
+    /// Optional basic-auth username; must be paired with [`Self::password`].
     pub username: Option<String>,
+    /// Optional basic-auth password; must be paired with [`Self::username`].
     pub password: Option<String>,
 }
 
 impl Settings {
+    /// Loads and validates settings from the process environment.
+    ///
+    /// A local `.env` file is loaded before environment variables are read. Existing
+    /// process variables retain precedence.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ConfigError`] when a required value is missing or any supplied value
+    /// fails validation.
     pub fn from_env() -> Result<Self, ConfigError> {
         dotenvy::dotenv().ok();
         Self::from_source(|key| env::var(key).ok())
     }
 
+    /// Loads settings from an abstract key-value source.
+    ///
+    /// Keeping parsing independent from process-global environment mutation makes the
+    /// configuration contract deterministic in unit tests.
     fn from_source(get: impl Fn(&str) -> Option<String>) -> Result<Self, ConfigError> {
         let server_host = optional(&get, "APP_HOST", "0.0.0.0");
         let server_port = parse(&get, "APP_PORT", "3000")?;
@@ -99,6 +136,12 @@ impl Settings {
         Ok(settings)
     }
 
+    /// Combines the configured HTTP host and port into a socket address.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ConfigError::InvalidSocketAddress`] when the two values do not form
+    /// a valid IP socket address.
     pub fn server_address(&self) -> Result<SocketAddr, ConfigError> {
         SocketAddr::from_str(&format!("{}:{}", self.server_host, self.server_port)).map_err(|_| {
             ConfigError::InvalidSocketAddress {
@@ -109,6 +152,7 @@ impl Settings {
     }
 }
 
+/// Reads a required, non-blank value from a configuration source.
 fn required(
     get: &impl Fn(&str) -> Option<String>,
     key: &'static str,
@@ -116,14 +160,17 @@ fn required(
     non_empty(get(key)).ok_or(ConfigError::Missing(key))
 }
 
+/// Reads a non-blank value or returns its configured default.
 fn optional(get: &impl Fn(&str) -> Option<String>, key: &str, default: &str) -> String {
     non_empty(get(key)).unwrap_or_else(|| default.to_owned())
 }
 
+/// Converts blank strings into missing values.
 fn non_empty(value: Option<String>) -> Option<String> {
     value.filter(|value| !value.trim().is_empty())
 }
 
+/// Parses a typed value from a configuration source or its default.
 fn parse<T>(
     get: &impl Fn(&str) -> Option<String>,
     key: &'static str,
@@ -138,6 +185,7 @@ where
         .map_err(|_| ConfigError::InvalidValue { key, value })
 }
 
+/// Parses a URL and restricts it to an explicit set of schemes.
 fn validate_url_scheme(
     key: &'static str,
     value: &str,
@@ -154,27 +202,56 @@ fn validate_url_scheme(
 }
 
 #[derive(Debug, Error, PartialEq, Eq)]
+/// Validation failures produced while loading [`Settings`].
 pub enum ConfigError {
+    /// A required environment variable was not set or contained only whitespace.
     #[error("missing required environment variable {0}")]
     Missing(&'static str),
+    /// An environment variable could not be parsed into its expected scalar type.
     #[error("{key} has invalid value {value:?}")]
-    InvalidValue { key: &'static str, value: String },
+    InvalidValue {
+        /// Name of the invalid environment variable.
+        key: &'static str,
+        /// Invalid value supplied by the environment.
+        value: String,
+    },
+    /// An endpoint setting was not a syntactically valid URL.
     #[error("{0} must be a valid URL")]
     InvalidUrl(&'static str),
+    /// A URL used a scheme that is unsupported for its target service.
     #[error("{key} must use the {expected} URL scheme")]
-    InvalidUrlScheme { key: &'static str, expected: String },
+    InvalidUrlScheme {
+        /// Name of the environment variable containing the URL.
+        key: &'static str,
+        /// Human-readable list of accepted URL schemes.
+        expected: String,
+    },
+    /// MySQL pool minimum and maximum values were inconsistent.
     #[error(
         "DATABASE_MIN_CONNECTIONS ({min}) cannot exceed DATABASE_MAX_CONNECTIONS ({max}), and the maximum must be greater than zero"
     )]
-    InvalidPoolLimits { min: u32, max: u32 },
+    InvalidPoolLimits {
+        /// Configured minimum connection count.
+        min: u32,
+        /// Configured maximum connection count.
+        max: u32,
+    },
+    /// Only one of the two required OpenSearch basic-auth values was supplied.
     #[error(
         "OPENSEARCH_USERNAME and OPENSEARCH_PASSWORD must either both be set or both be omitted"
     )]
     IncompleteOpenSearchCredentials,
+    /// A duration setting was configured as zero milliseconds.
     #[error("{0} must be greater than zero")]
     ZeroDuration(&'static str),
+    /// The configured HTTP host and port did not form a valid socket address.
     #[error("APP_HOST {host:?} and APP_PORT {port} do not form a valid socket address")]
-    InvalidSocketAddress { host: String, port: u16 },
+    InvalidSocketAddress {
+        /// Configured HTTP host.
+        host: String,
+        /// Configured HTTP port.
+        port: u16,
+    },
 }
 
 #[cfg(test)]
