@@ -100,8 +100,41 @@ impl FromStr for DatabaseTlsMode {
 #[derive(Clone)]
 /// Redis connection configuration.
 pub struct RedisSettings {
-    /// Redis connection URL using the `redis` or `rediss` scheme.
+    /// Redis connection URL using the `redis` or `rediss` scheme. It may contain a
+    /// password, so this struct deliberately does not implement `Debug`.
     pub url: String,
+    /// Maximum duration allowed when establishing or re-establishing a connection.
+    pub connect_timeout: Duration,
+    /// Maximum duration allowed for one Redis command, including reconnection.
+    pub command_timeout: Duration,
+    /// TLS policy applied to Redis connections.
+    pub tls_mode: RedisTlsMode,
+    /// Optional path to an additional PEM-encoded certificate authority.
+    pub tls_ca_path: Option<PathBuf>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// TLS policy used by the Redis client.
+pub enum RedisTlsMode {
+    /// Do not use TLS. This is reserved for the isolated local stack.
+    Disabled,
+    /// Require encrypted transport without certificate or hostname verification.
+    Required,
+    /// Require TLS and verify the server certificate and hostname.
+    Verify,
+}
+
+impl FromStr for RedisTlsMode {
+    type Err = ();
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value.to_ascii_lowercase().as_str() {
+            "disabled" => Ok(Self::Disabled),
+            "required" => Ok(Self::Required),
+            "verify" => Ok(Self::Verify),
+            _ => Err(()),
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -161,7 +194,23 @@ impl Settings {
         }
 
         let redis_url = required(&get, "REDIS_URL")?;
-        validate_url_scheme("REDIS_URL", &redis_url, &["redis", "rediss"])?;
+        let parsed_redis_url = validate_url_scheme("REDIS_URL", &redis_url, &["redis", "rediss"])?;
+        let redis_tls_mode: RedisTlsMode = parse(&get, "REDIS_TLS_MODE", "verify")?;
+        let uses_tls_scheme = parsed_redis_url.scheme() == "rediss";
+        if uses_tls_scheme != (redis_tls_mode != RedisTlsMode::Disabled) {
+            return Err(ConfigError::RedisTlsSchemeMismatch);
+        }
+        let redis_connect_timeout = duration(&get, "REDIS_CONNECT_TIMEOUT_MS", "2000")?;
+        let redis_command_timeout = duration(&get, "REDIS_COMMAND_TIMEOUT_MS", "1000")?;
+        let redis_tls_ca_path = non_empty(get("REDIS_TLS_CA_PATH")).map(PathBuf::from);
+        if let Some(path) = redis_tls_ca_path.as_ref() {
+            if redis_tls_mode != RedisTlsMode::Verify {
+                return Err(ConfigError::RedisTlsCaRequiresVerify);
+            }
+            if !path.is_file() || std::fs::File::open(path).is_err() {
+                return Err(ConfigError::InvalidRedisTlsCaPath(path.clone()));
+            }
+        }
 
         let opensearch_url_raw = required(&get, "OPENSEARCH_URL")?;
         let opensearch_url =
@@ -204,7 +253,13 @@ impl Settings {
                 tls_mode: database_tls_mode,
                 tls_ca_path: database_tls_ca_path,
             },
-            redis: RedisSettings { url: redis_url },
+            redis: RedisSettings {
+                url: redis_url,
+                connect_timeout: redis_connect_timeout,
+                command_timeout: redis_command_timeout,
+                tls_mode: redis_tls_mode,
+                tls_ca_path: redis_tls_ca_path,
+            },
             opensearch: OpenSearchSettings {
                 url: opensearch_url,
                 username,
@@ -347,6 +402,15 @@ pub enum ConfigError {
     /// The configured custom certificate authority path was not a readable file.
     #[error("DATABASE_TLS_CA_PATH does not identify a readable file: {0:?}")]
     InvalidTlsCaPath(PathBuf),
+    /// `REDIS_URL` scheme and `REDIS_TLS_MODE` disagree about whether TLS is used.
+    #[error("REDIS_URL must use rediss:// exactly when REDIS_TLS_MODE is required or verify")]
+    RedisTlsSchemeMismatch,
+    /// A Redis CA path was supplied for a TLS mode that does not verify certificates.
+    #[error("REDIS_TLS_CA_PATH requires REDIS_TLS_MODE verify")]
+    RedisTlsCaRequiresVerify,
+    /// The configured Redis certificate authority path was not a readable file.
+    #[error("REDIS_TLS_CA_PATH does not identify a readable file: {0:?}")]
+    InvalidRedisTlsCaPath(PathBuf),
     /// A duration setting was configured as zero milliseconds.
     #[error("{0} must be greater than zero")]
     ZeroDuration(&'static str),
@@ -377,7 +441,7 @@ mod tests {
     fn required_values() -> Vec<(&'static str, &'static str)> {
         vec![
             ("DATABASE_URL", "mysql://app:secret@localhost/app"),
-            ("REDIS_URL", "redis://localhost:6379"),
+            ("REDIS_URL", "rediss://localhost:6379"),
             ("OPENSEARCH_URL", "http://localhost:9200"),
         ]
     }
@@ -400,7 +464,7 @@ mod tests {
     #[test]
     fn rejects_a_missing_required_value() {
         let error = settings(&[
-            ("REDIS_URL", "redis://localhost:6379"),
+            ("REDIS_URL", "rediss://localhost:6379"),
             ("OPENSEARCH_URL", "http://localhost:9200"),
         ])
         .err()
@@ -502,6 +566,74 @@ mod tests {
         assert_eq!(
             settings(&values).err().unwrap(),
             ConfigError::TlsCaRequiresVerification
+        );
+    }
+
+    #[test]
+    fn loads_redis_defaults_and_explicit_values() {
+        let loaded = settings(&required_values()).unwrap();
+        assert_eq!(loaded.redis.tls_mode, RedisTlsMode::Verify);
+        assert_eq!(loaded.redis.connect_timeout, Duration::from_secs(2));
+        assert_eq!(loaded.redis.command_timeout, Duration::from_secs(1));
+
+        let mut values = required_values();
+        values[1] = ("REDIS_URL", "redis://localhost:6379");
+        values.extend([
+            ("REDIS_TLS_MODE", "disabled"),
+            ("REDIS_CONNECT_TIMEOUT_MS", "100"),
+            ("REDIS_COMMAND_TIMEOUT_MS", "200"),
+        ]);
+        let loaded = settings(&values).unwrap();
+        assert_eq!(loaded.redis.tls_mode, RedisTlsMode::Disabled);
+        assert_eq!(loaded.redis.connect_timeout, Duration::from_millis(100));
+        assert_eq!(loaded.redis.command_timeout, Duration::from_millis(200));
+    }
+
+    #[test]
+    fn rejects_invalid_redis_settings() {
+        for key in ["REDIS_CONNECT_TIMEOUT_MS", "REDIS_COMMAND_TIMEOUT_MS"] {
+            let mut values = required_values();
+            values.push((key, "0"));
+            assert_eq!(
+                settings(&values).err().unwrap(),
+                ConfigError::ZeroDuration(key)
+            );
+        }
+
+        let mut values = required_values();
+        values.push(("REDIS_TLS_MODE", "sometimes"));
+        assert!(matches!(
+            settings(&values),
+            Err(ConfigError::InvalidValue {
+                key: "REDIS_TLS_MODE",
+                ..
+            })
+        ));
+
+        // TLS mode defaults to verify, which needs a rediss:// URL.
+        let mut values = required_values();
+        values[1] = ("REDIS_URL", "redis://localhost:6379");
+        assert_eq!(
+            settings(&values).err().unwrap(),
+            ConfigError::RedisTlsSchemeMismatch
+        );
+
+        // A rediss:// URL cannot be combined with disabled TLS.
+        let mut values = required_values();
+        values.push(("REDIS_TLS_MODE", "disabled"));
+        assert_eq!(
+            settings(&values).err().unwrap(),
+            ConfigError::RedisTlsSchemeMismatch
+        );
+
+        let mut values = required_values();
+        values.extend([
+            ("REDIS_TLS_MODE", "required"),
+            ("REDIS_TLS_CA_PATH", "unused.pem"),
+        ]);
+        assert_eq!(
+            settings(&values).err().unwrap(),
+            ConfigError::RedisTlsCaRequiresVerify
         );
     }
 

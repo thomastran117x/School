@@ -49,8 +49,8 @@ mod tests {
     };
     use crate::{
         app,
-        config::{DatabaseSettings, DatabaseTlsMode},
-        infrastructure::DatabaseClient,
+        config::{DatabaseSettings, DatabaseTlsMode, RedisSettings, RedisTlsMode},
+        infrastructure::{DatabaseClient, RedisClient},
         state::AppState,
     };
 
@@ -77,8 +77,18 @@ mod tests {
         })
         .await
         .expect("lazy test database should initialize");
+        let redis = RedisClient::initialize(&RedisSettings {
+            url: "redis://localhost:6379".to_owned(),
+            connect_timeout: std::time::Duration::from_secs(1),
+            command_timeout: std::time::Duration::from_secs(1),
+            tls_mode: RedisTlsMode::Disabled,
+            tls_ca_path: None,
+        })
+        .await
+        .expect("lazy test redis client should initialize");
         AppState::new(
             database,
+            redis,
             Arc::new(StubHealthService(ReadinessReport {
                 dependencies: statuses,
             })),

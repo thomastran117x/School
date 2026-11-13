@@ -37,12 +37,7 @@ impl DatastoreHealthService {
 
     /// Sends a Redis `PING` through the reconnecting connection manager.
     async fn redis(&self) -> bool {
-        let mut connection = self.datastores.redis.clone();
-        let ping = async move {
-            let response: String = redis::cmd("PING").query_async(&mut connection).await?;
-            Ok::<_, redis::RedisError>(response)
-        };
-        bounded("redis", self.timeout, ping).await
+        bounded("redis", self.timeout, self.datastores.redis.ping()).await
     }
 
     /// Sends an OpenSearch ping request and accepts only successful HTTP responses.
