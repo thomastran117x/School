@@ -22,7 +22,7 @@ jobs:
   backend:
     name: Quality, build, and tests
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    timeout-minutes: 45
 
     defaults:
       run:
@@ -63,4 +63,10 @@ jobs:
 
       - name: Run integration tests
         run: bash scripts/integration-test.sh
+
+      - name: Build deployment image
+        run: docker compose --profile full build api
+
+      - name: Verify packaged migration CLI
+        run: docker compose --profile full run --rm --no-deps --entrypoint migration api --version
 

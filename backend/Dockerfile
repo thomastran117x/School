@@ -5,7 +5,7 @@ RUN apt-get update \
     && apt-get install --yes --no-install-recommends libssl-dev pkg-config \
     && rm -rf /var/lib/apt/lists/*
 COPY . .
-RUN cargo build --locked --release -p backend-api
+RUN cargo build --locked --release -p backend-api -p migration
 
 FROM debian:bookworm-slim AS runtime
 
@@ -15,6 +15,7 @@ RUN apt-get update \
 
 RUN useradd --create-home --uid 10001 app
 COPY --from=builder /workspace/target/release/backend-api /usr/local/bin/backend-api
+COPY --from=builder /workspace/target/release/migration /usr/local/bin/migration
 
 USER app
 EXPOSE 3000

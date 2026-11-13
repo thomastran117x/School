@@ -7,7 +7,7 @@ An Axum backend foundation with SeaORM/MySQL, Redis, and OpenSearch. The HTTP se
 ```text
 backend/
 ├── crates/api/       Axum application organized as feature-based vertical slices
-├── migration/        SeaORM migration CLI (no domain migrations yet)
+├── migration/        Versioned SeaORM migrations and migration CLI
 ├── compose.yaml      Local datastores and optional complete stack
 └── Dockerfile        Multi-stage production-style API image
 ```
@@ -102,16 +102,42 @@ The Compose OpenSearch service disables its security plugin for local developmen
 
 ## Migrations
 
-The migration crate is ready for schema migrations but intentionally starts empty. It never runs implicitly during API startup.
+The migration crate owns the authoritative MySQL schema for users, external identities, courses, applications, and application reviews. Migrations never run implicitly during API startup; run them as an explicit release step before deploying application instances that depend on the new schema.
+
+All primary and foreign keys use application-generated UUIDv7 values stored as `BINARY(16)`. Application timestamps are UTC `DATETIME(6)` values. The database enforces account roles and states, application and review states, positive course capacity, unique emails and course codes, one application per student and course, one final review per application, and audit-preserving foreign keys.
+
+For local development, apply and inspect migrations with:
 
 ```powershell
 cargo run -p migration -- generate create_example_table
 cargo run -p migration -- up
 cargo run -p migration -- status
-cargo run -p migration -- down
+cargo run -p migration -- down --num 1
 ```
 
 The migration CLI reads `DATABASE_URL`, `DATABASE_TLS_MODE`, and optional `DATABASE_TLS_CA_PATH` from the environment. It applies the same secure TLS default as the API.
+
+The production image includes the same migration executable as the workspace. After building the image, the Compose-backed equivalent of a deployment migration job is:
+
+```powershell
+docker compose up --detach --wait mysql
+docker compose --profile full build api
+docker compose --profile full run --rm --no-deps --entrypoint migration api up
+```
+
+For another deployment platform, run `/usr/local/bin/migration up` from the release image as a one-off job with the same database URL and TLS environment used by the API. Run only one migration job at a time and wait for it to succeed before rolling out the corresponding API release.
+
+### Rollback and recovery
+
+Prefer a forward corrective migration after a release has reached a shared environment. Before any rollback, take a verified database backup and roll back application instances that depend on the newer schema. `migration down --num 1` reverses only the latest migration; the initial domain migrations drop their tables and therefore destroy the data in those tables.
+
+Use `migration reset`, `migration refresh`, and `migration fresh` only against disposable local or CI databases. MySQL commits data-definition statements implicitly. If a migration fails, inspect `migration status` and the actual schema before retrying. Do not expect API restarts to repair the schema. For an ambiguous or destructive partial failure, stop deployment and restore the verified backup or ship a reviewed corrective migration.
+
+The migration contract test uses the isolated Compose database to exercise clean apply, idempotent reapply, constraints, full rollback, and reapplication:
+
+```bash
+bash scripts/test-migrations.sh
+```
 
 ## Quality checks
 
@@ -130,9 +156,10 @@ The GitHub Actions workflow at `.github/workflows/backend-ci.yml` runs for backe
 1. Rust formatting and strict Clippy checks.
 2. Locked compile checks and a complete workspace build.
 3. Unit tests for library and binary targets.
-4. Docker-backed integration tests against MySQL, Redis, and OpenSearch.
+4. Docker-backed migration and integration tests against clean MySQL, Redis, and OpenSearch services.
+5. A production image build and smoke test of its packaged migration CLI.
 
-The integration suite verifies migrations, required-TLS MySQL connectivity, bounded queries, pool exhaustion, liveness, healthy readiness, degraded readiness while Redis or MySQL is stopped, and automatic recovery after each service restarts. Run the same suite locally from a Bash-compatible shell:
+The integration suite applies, rolls back, and reapplies migrations while checking schema constraints, then verifies required-TLS MySQL connectivity, bounded queries, pool exhaustion, liveness, healthy readiness, degraded readiness while Redis or MySQL is stopped, and automatic recovery after each service restarts. Run the same suite locally from a Bash-compatible shell:
 
 ```bash
 bash scripts/integration-test.sh

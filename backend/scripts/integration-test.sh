@@ -94,8 +94,8 @@ docker compose up \
     --wait-timeout 240 \
     mysql redis opensearch
 
-echo "Checking the SeaORM migration connection."
-cargo run --locked -p migration -- status
+echo "Checking the complete SeaORM migration lifecycle."
+bash scripts/test-migrations.sh
 
 echo "Checking MySQL connectivity, query deadlines, and pool exhaustion."
 cargo test --locked -p backend-api --bin backend-api \
