@@ -96,7 +96,7 @@ fn make_span<B>(request: &axum::http::Request<B>) -> Span {
 
 #[cfg(test)]
 mod tests {
-    use std::{sync::Arc, time::Duration};
+    use std::sync::Arc;
 
     use async_trait::async_trait;
     use axum::{
@@ -109,15 +109,9 @@ mod tests {
 
     use super::*;
     use crate::{
-        config::{
-            AuthSettings, CorsSettings, DatabaseSettings, DatabaseTlsMode, RedisSettings,
-            RedisTlsMode,
-        },
-        features::{
-            auth::refresh_store::RedisRefreshSessionStore,
-            health::{DependencyState, DependencyStatuses, HealthService, ReadinessReport},
-        },
-        infrastructure::{DatabaseClient, RedisClient},
+        config::CorsSettings,
+        features::health::{DependencyState, DependencyStatuses, HealthService, ReadinessReport},
+        infrastructure::DatabaseClient,
     };
 
     struct StubHealth;
@@ -132,35 +126,7 @@ mod tests {
     }
 
     async fn state() -> AppState {
-        let database = DatabaseClient::initialize(&DatabaseSettings {
-            url: "mysql://test:test@localhost/test".to_owned(),
-            min_connections: 0,
-            max_connections: 1,
-            connect_timeout: Duration::from_secs(1),
-            acquire_timeout: Duration::from_secs(1),
-            query_timeout: Duration::from_secs(1),
-            tls_mode: DatabaseTlsMode::Disabled,
-            tls_ca_path: None,
-        })
-        .await
-        .unwrap();
-        let redis = RedisClient::initialize(&RedisSettings {
-            url: "redis://localhost:6379".to_owned(),
-            connect_timeout: Duration::from_secs(1),
-            command_timeout: Duration::from_secs(1),
-            tls_mode: RedisTlsMode::Disabled,
-            tls_ca_path: None,
-        })
-        .await
-        .unwrap();
-        let sessions = Arc::new(RedisRefreshSessionStore::new(
-            redis.clone(),
-            AuthSettings {
-                refresh_token_ttl: Duration::from_secs(60),
-                refresh_family_max_lifetime: Duration::from_secs(120),
-            },
-        ));
-        AppState::new(database, redis, Arc::new(StubHealth), sessions)
+        crate::state::test_support::lazy_state(Arc::new(StubHealth)).await
     }
 
     fn http(origins: &[&str], credentials: bool) -> HttpSettings {
