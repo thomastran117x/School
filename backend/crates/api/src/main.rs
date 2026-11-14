@@ -32,6 +32,7 @@ async fn main() -> anyhow::Result<()> {
         .await
         .context("failed to initialize datastore clients")?;
     let database = datastores.mysql.clone();
+    let database_for_shutdown = database.clone();
     let redis = datastores.redis.clone();
     let refresh_sessions = Arc::new(RedisRefreshSessionStore::new(
         redis.clone(),
@@ -57,10 +58,29 @@ async fn main() -> anyhow::Result<()> {
         .context("failed to read HTTP listener address")?;
     tracing::info!(%address, "HTTP server listening");
 
-    axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown::signal())
-        .await
-        .context("HTTP server stopped unexpectedly")?;
+    let shutdown_timeout = settings.shutdown_timeout;
+    let outcome =
+        shutdown::serve_with_deadline(shutdown::signal(), shutdown_timeout, |trigger| async move {
+            axum::serve(listener, app)
+                .with_graceful_shutdown(trigger)
+                .await
+        })
+        .await;
+
+    match outcome {
+        Some(result) => result.context("HTTP server stopped unexpectedly")?,
+        None => tracing::warn!(
+            timeout_ms = u64::try_from(shutdown_timeout.as_millis()).unwrap_or(u64::MAX),
+            "shutdown timeout elapsed; dropping remaining connections"
+        ),
+    }
+
+    match tokio::time::timeout(shutdown_timeout, database_for_shutdown.close()).await {
+        Ok(Ok(())) => tracing::info!("database pool closed"),
+        Ok(Err(error)) => tracing::warn!(%error, "failed to close database pool"),
+        Err(_) => tracing::warn!("timed out closing database pool"),
+    }
+    tracing::info!("shutdown complete");
 
     Ok(())
 }

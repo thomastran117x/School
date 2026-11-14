@@ -96,6 +96,7 @@ Configuration comes from environment variables. For local Cargo runs, `dotenvy` 
 | `OPENSEARCH_USERNAME` | No | — | Optional basic-auth username |
 | `OPENSEARCH_PASSWORD` | No | — | Optional basic-auth password; must accompany username |
 | `HEALTH_CHECK_TIMEOUT_MS` | No | `2000` | Per-dependency readiness timeout |
+| `SHUTDOWN_TIMEOUT_MS` | No | `10000` | Maximum time in-flight requests may drain after SIGTERM/SIGINT before connections are dropped; see [Graceful shutdown](#graceful-shutdown) |
 | `REFRESH_TOKEN_TTL_SECONDS` | No | `604800` | Lifetime of each refresh token (1 second to 30 days) |
 | `REFRESH_FAMILY_MAX_LIFETIME_SECONDS` | No | `2592000` | Absolute lifetime of a refresh-session family; at least the token TTL, at most 30 days |
 | `COURSE_CACHE_DETAIL_TTL_SECONDS` | No | `300` | Lifetime of a cached course read (1 second to 30 days); also the staleness bound if an invalidation is missed |
@@ -125,6 +126,17 @@ The example environment explicitly disables MySQL TLS only for the localhost/iso
 The API creates one lazy SeaORM pool and shares its cloneable handle through application state. Startup validates the connection URL, TLS policy, pool bounds, and timeout values without contacting MySQL or logging the URL. Database-backed features should run operations through the bounded database client so pool exhaustion and query deadlines become sanitized typed errors rather than raw SQLx or SeaORM failures.
 
 The API creates one lazy, auto-reconnecting Redis connection manager at startup and shares its cloneable handle through `AppState`. `REDIS_TLS_MODE` defaults to `verify` (certificate and hostname checks, optional custom CA); `required` encrypts without authenticating the server; `disabled` is for the isolated local stack only. `rediss://` must be used exactly when TLS is enabled. Startup validates the URL and TLS settings without contacting Redis or logging the URL. Every command runs through `RedisClient`, so connection, command, and TTL failures become sanitized typed errors (`RedisError`) that never include the URL, password, keys, or values.
+
+### Graceful shutdown
+
+On SIGTERM (or SIGINT/Ctrl+C) the API:
+
+1. Stops accepting new connections and starts draining in-flight requests.
+2. Waits up to `SHUTDOWN_TIMEOUT_MS` (default 10 seconds, measured from the signal). Anything still running after that is abandoned and its connections are dropped, with a `shutdown timeout elapsed` warning.
+3. Closes the MySQL pool (bounded by the same timeout). Redis and OpenSearch clients hold no state that needs flushing and are released on exit.
+4. Logs `shutdown complete` and exits with status 0.
+
+**Deployment requirement:** the orchestrator's termination grace period must be longer than `SHUTDOWN_TIMEOUT_MS` plus a few seconds for pool close, otherwise the process is SIGKILLed mid-drain. The Compose `api` service sets `stop_grace_period: 15s` for the default 10s; raise both together. On Kubernetes set `terminationGracePeriodSeconds` accordingly and let readiness fail or remove the pod from the Service endpoints before SIGTERM (for example with a short `preStop` sleep). The container runs the binary as PID 1 via exec-form `ENTRYPOINT`, so it receives the signal directly; do not wrap it in a shell script.
 
 ### Redis keys and TTLs
 

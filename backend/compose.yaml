@@ -66,6 +66,7 @@ services:
       APP_PORT: 3000
       RUST_LOG: ${RUST_LOG:-backend_api=info,tower_http=info}
       HEALTH_CHECK_TIMEOUT_MS: ${HEALTH_CHECK_TIMEOUT_MS:-2000}
+      SHUTDOWN_TIMEOUT_MS: ${SHUTDOWN_TIMEOUT_MS:-10000}
       APP_ENV: ${APP_ENV:-development}
       SERVICE_NAME: ${SERVICE_NAME:-school-api}
       HTTP_HTTPS_ENABLED: ${HTTP_HTTPS_ENABLED:-false}
@@ -108,6 +109,8 @@ services:
       interval: 10s
       timeout: 3s
       retries: 10
+    # Must exceed SHUTDOWN_TIMEOUT_MS plus pool-close time, or Docker SIGKILLs mid-drain.
+    stop_grace_period: 15s
     restart: unless-stopped
 
 volumes:

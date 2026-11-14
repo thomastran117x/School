@@ -89,6 +89,22 @@ impl DatabaseClient {
     pub async fn ping(&self) -> Result<(), DatabaseError> {
         self.run(|connection| Box::pin(connection.ping())).await
     }
+
+    /// Closes the pool, releasing idle connections and rejecting new acquisitions.
+    ///
+    /// Closing a pool that never connected succeeds immediately.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DatabaseError::Unavailable`] when the driver fails to close
+    /// cleanly. The driver error is not exposed.
+    pub async fn close(&self) -> Result<(), DatabaseError> {
+        self.connection
+            .clone()
+            .close()
+            .await
+            .map_err(|_| DatabaseError::Unavailable)
+    }
 }
 
 #[derive(Debug, Error)]
