@@ -30,6 +30,8 @@ pub struct Settings {
     pub course_cache: CourseCacheSettings,
     /// Maximum duration allowed for each dependency readiness probe.
     pub health_check_timeout: Duration,
+    /// Maximum time in-flight requests may drain after a shutdown signal.
+    pub shutdown_timeout: Duration,
     /// [`tracing_subscriber::EnvFilter`] expression used by application telemetry.
     pub log_filter: String,
     /// Deployment environment, which selects log format and is attached to log events.
@@ -371,6 +373,7 @@ impl Settings {
         if health_check_timeout_ms == 0 {
             return Err(ConfigError::ZeroDuration("HEALTH_CHECK_TIMEOUT_MS"));
         }
+        let shutdown_timeout = duration(&get, "SHUTDOWN_TIMEOUT_MS", "10000")?;
         let database_connect_timeout = duration(&get, "DATABASE_CONNECT_TIMEOUT_MS", "2000")?;
         let database_acquire_timeout = duration(&get, "DATABASE_ACQUIRE_TIMEOUT_MS", "2000")?;
         let database_query_timeout = duration(&get, "DATABASE_QUERY_TIMEOUT_MS", "5000")?;
@@ -435,6 +438,7 @@ impl Settings {
             },
             course_cache,
             health_check_timeout: Duration::from_millis(health_check_timeout_ms),
+            shutdown_timeout,
             log_filter: optional(&get, "RUST_LOG", "backend_api=info,tower_http=info"),
             environment: parse(&get, "APP_ENV", "production")?,
             service_name: optional(&get, "SERVICE_NAME", "school-api"),
@@ -771,6 +775,7 @@ mod tests {
         assert_eq!(loaded.database.query_timeout, Duration::from_secs(5));
         assert_eq!(loaded.database.tls_mode, DatabaseTlsMode::VerifyIdentity);
         assert_eq!(loaded.health_check_timeout, Duration::from_secs(2));
+        assert_eq!(loaded.shutdown_timeout, Duration::from_secs(10));
         assert!(loaded.opensearch.username.is_none());
         assert_eq!(
             loaded.auth.refresh_token_ttl,
@@ -780,6 +785,25 @@ mod tests {
             loaded.auth.refresh_family_max_lifetime,
             Duration::from_secs(30 * 24 * 60 * 60)
         );
+    }
+
+    #[test]
+    fn validates_shutdown_timeout() {
+        let with = |value: &'static str| {
+            let mut values = required_values();
+            values.push(("SHUTDOWN_TIMEOUT_MS", value));
+            settings(&values)
+        };
+
+        assert_eq!(
+            with("2500").unwrap().shutdown_timeout,
+            Duration::from_millis(2500)
+        );
+        assert_eq!(
+            with("0").err(),
+            Some(ConfigError::ZeroDuration("SHUTDOWN_TIMEOUT_MS"))
+        );
+        assert!(with("soon").is_err());
     }
 
     #[test]

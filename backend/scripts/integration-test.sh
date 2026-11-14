@@ -185,5 +185,25 @@ wait_for_status \
     120
 grep -q '"mysql":"up"' "${RESPONSE_BODY}"
 
+echo "Verifying graceful shutdown on SIGTERM."
+kill -TERM "${API_PID}"
+shutdown_status=0
+for _ in $(seq 1 30); do
+    kill -0 "${API_PID}" 2>/dev/null || break
+    sleep 1
+done
+if kill -0 "${API_PID}" 2>/dev/null; then
+    echo "API did not exit within 30 seconds of SIGTERM." >&2
+    exit 1
+fi
+wait "${API_PID}" || shutdown_status=$?
+API_PID=""
+if (( shutdown_status != 0 )); then
+    echo "API exited with status ${shutdown_status} after SIGTERM." >&2
+    exit 1
+fi
+grep -q 'shutdown signal received' "${API_LOG}"
+grep -q 'shutdown complete' "${API_LOG}"
+
 echo "Integration tests passed."
 
