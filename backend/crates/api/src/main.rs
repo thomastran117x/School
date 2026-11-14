@@ -19,9 +19,12 @@ mod telemetry;
 use std::sync::Arc;
 
 use anyhow::Context;
-use features::{auth::refresh_store::RedisRefreshSessionStore, health::DatastoreHealthService};
+use features::{
+    auth::refresh_store::RedisRefreshSessionStore, courses::cache::CourseCache,
+    health::DatastoreHealthService,
+};
 use infrastructure::Datastores;
-use state::AppState;
+use state::{AppState, AppStateParts};
 
 #[tokio::main]
 /// Loads the application and serves HTTP requests until a shutdown signal arrives.
@@ -39,13 +42,27 @@ async fn main() -> anyhow::Result<()> {
         redis.clone(),
         settings.auth.clone(),
     ));
+    let course_cache = Arc::new(CourseCache::new(
+        redis.clone(),
+        settings.course_cache.clone(),
+    ));
+    let opensearch = datastores.opensearch.clone();
     let health = Arc::new(DatastoreHealthService::new(
         datastores,
         settings.health_check_timeout,
     ));
+    let http_settings = settings.http.clone();
     let app = app::router_with(
-        AppState::new(database, redis, health, refresh_sessions),
-        &settings.http,
+        AppState::from_parts(AppStateParts {
+            config: Arc::new(settings.clone()),
+            database,
+            redis,
+            opensearch,
+            health,
+            refresh_sessions,
+            course_cache,
+        }),
+        &http_settings,
     );
 
     let bind_address = settings

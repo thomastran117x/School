@@ -49,10 +49,8 @@ mod tests {
     };
     use crate::{
         app,
-        config::{AuthSettings, DatabaseSettings, DatabaseTlsMode, RedisSettings, RedisTlsMode},
-        features::auth::refresh_store::RedisRefreshSessionStore,
-        infrastructure::{DatabaseClient, RedisClient},
-        state::AppState,
+        infrastructure::DatabaseClient,
+        state::{AppState, test_support},
     };
 
     #[derive(Clone)]
@@ -66,42 +64,10 @@ mod tests {
     }
 
     async fn state_with(statuses: DependencyStatuses) -> AppState {
-        let database = DatabaseClient::initialize(&DatabaseSettings {
-            url: "mysql://test:test@localhost/test".to_owned(),
-            min_connections: 0,
-            max_connections: 1,
-            connect_timeout: std::time::Duration::from_secs(1),
-            acquire_timeout: std::time::Duration::from_secs(1),
-            query_timeout: std::time::Duration::from_secs(1),
-            tls_mode: DatabaseTlsMode::Disabled,
-            tls_ca_path: None,
-        })
+        test_support::lazy_state(Arc::new(StubHealthService(ReadinessReport {
+            dependencies: statuses,
+        })))
         .await
-        .expect("lazy test database should initialize");
-        let redis = RedisClient::initialize(&RedisSettings {
-            url: "redis://localhost:6379".to_owned(),
-            connect_timeout: std::time::Duration::from_secs(1),
-            command_timeout: std::time::Duration::from_secs(1),
-            tls_mode: RedisTlsMode::Disabled,
-            tls_ca_path: None,
-        })
-        .await
-        .expect("lazy test redis client should initialize");
-        let refresh_sessions = Arc::new(RedisRefreshSessionStore::new(
-            redis.clone(),
-            AuthSettings {
-                refresh_token_ttl: std::time::Duration::from_secs(60),
-                refresh_family_max_lifetime: std::time::Duration::from_secs(120),
-            },
-        ));
-        AppState::new(
-            database,
-            redis,
-            Arc::new(StubHealthService(ReadinessReport {
-                dependencies: statuses,
-            })),
-            refresh_sessions,
-        )
     }
 
     async fn response_json(response: axum::response::Response) -> Value {
