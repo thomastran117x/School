@@ -22,6 +22,9 @@ export REDIS_TLS_MODE="disabled"
 export REDIS_URL="redis://127.0.0.1:${REDIS_PORT}"
 export OPENSEARCH_URL="http://127.0.0.1:${OPENSEARCH_PORT}"
 export APP_HOST="127.0.0.1"
+METRICS_PORT="${METRICS_PORT:-19090}"
+export METRICS_ADDR="127.0.0.1:${METRICS_PORT}"
+export METRICS_BEARER_TOKEN="integration-test-token"
 export RUST_LOG="backend_api=info"
 
 TEST_TMP_DIR="$(mktemp -d)"
@@ -62,6 +65,11 @@ request_status() {
         --output "${RESPONSE_BODY}" \
         --write-out '%{http_code}' \
         "${url}" || true
+}
+
+# Scrapes the protected metrics listener into RESPONSE_BODY.
+scrape_metrics() {
+    curl --silent --show-error --fail         --header "Authorization: Bearer ${METRICS_BEARER_TOKEN}"         --output "${RESPONSE_BODY}"         "http://127.0.0.1:${METRICS_PORT}/metrics"
 }
 
 wait_for_status() {
@@ -143,6 +151,22 @@ grep -q '"mysql":"up"' "${RESPONSE_BODY}"
 grep -q '"redis":"up"' "${RESPONSE_BODY}"
 grep -q '"opensearch":"up"' "${RESPONSE_BODY}"
 
+echo "Verifying the metrics endpoint is protected and reports healthy dependencies."
+unauthenticated_status="$(curl --silent --output /dev/null --write-out '%{http_code}'     "http://127.0.0.1:${METRICS_PORT}/metrics" || true)"
+if [[ "${unauthenticated_status}" != "401" ]]; then
+    echo "Expected 401 without a scrape token, got ${unauthenticated_status}." >&2
+    exit 1
+fi
+if [[ "$(request_status "http://127.0.0.1:${APP_PORT}/metrics")" != "404" ]]; then
+    echo "The public API port must not serve /metrics." >&2
+    exit 1
+fi
+scrape_metrics
+grep -q 'dependency_up{dependency="mysql"} 1' "${RESPONSE_BODY}"
+grep -q 'dependency_up{dependency="redis"} 1' "${RESPONSE_BODY}"
+grep -q 'dependency_up{dependency="opensearch"} 1' "${RESPONSE_BODY}"
+grep -q 'http_requests_total{method="GET",route="/health/live",status="200"}' "${RESPONSE_BODY}"
+
 echo "Verifying degraded readiness when Redis is unavailable."
 docker compose stop redis
 wait_for_status \
@@ -152,6 +176,9 @@ wait_for_status \
 grep -q '"mysql":"up"' "${RESPONSE_BODY}"
 grep -q '"redis":"down"' "${RESPONSE_BODY}"
 grep -q '"opensearch":"up"' "${RESPONSE_BODY}"
+scrape_metrics
+grep -q 'dependency_up{dependency="redis"} 0' "${RESPONSE_BODY}"
+grep -q 'dependency_probe_failures_total{dependency="redis"}' "${RESPONSE_BODY}"
 
 echo "Verifying readiness recovery after Redis restarts."
 docker compose start redis
@@ -161,6 +188,8 @@ wait_for_status \
     "Redis readiness to recover" \
     120
 grep -q '"redis":"up"' "${RESPONSE_BODY}"
+scrape_metrics
+grep -q 'dependency_up{dependency="redis"} 1' "${RESPONSE_BODY}"
 
 echo "Verifying degraded readiness when MySQL is unavailable."
 docker compose stop mysql

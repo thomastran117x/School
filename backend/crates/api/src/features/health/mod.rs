@@ -14,9 +14,12 @@ use crate::state::AppState;
 /// Datastore-backed health implementation and the feature's service contract.
 pub(crate) use service::{DatastoreHealthService, HealthService};
 
-/// Readiness report types, exposed so router-level tests can stub the service.
+/// Dependency status types, shared with the metrics scrape.
+pub(crate) use models::{DependencyState, DependencyStatuses};
+
+/// Readiness report type, exposed so router-level tests can stub the service.
 #[cfg(test)]
-pub(crate) use models::{DependencyState, DependencyStatuses, ReadinessReport};
+pub(crate) use models::ReadinessReport;
 
 /// Builds the health feature router mounted below `/health`.
 pub(crate) fn router() -> Router<AppState> {
