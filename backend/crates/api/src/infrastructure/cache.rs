@@ -312,10 +312,7 @@ impl Cache {
     /// # Errors
     ///
     /// Returns a sanitized [`RedisError`] when the transaction fails.
-    pub async fn atomic(
-        &self,
-        build: impl FnOnce(&mut redis::Pipeline),
-    ) -> Result<(), RedisError> {
+    pub async fn atomic(&self, build: impl FnOnce(&mut redis::Pipeline)) -> Result<(), RedisError> {
         let mut pipeline = redis::pipe();
         pipeline.atomic();
         build(&mut pipeline);
@@ -391,7 +388,10 @@ mod tests {
         let cache = offline().await;
         let key = key();
         for bad in [Duration::ZERO, Duration::from_millis(999), Duration::MAX] {
-            assert_eq!(cache.set_nx(&key, "v", bad).await, Err(RedisError::InvalidTtl));
+            assert_eq!(
+                cache.set_nx(&key, "v", bad).await,
+                Err(RedisError::InvalidTtl)
+            );
             assert_eq!(cache.expire(&key, bad).await, Err(RedisError::InvalidTtl));
             assert_eq!(cache.incr(&key, bad).await, Err(RedisError::InvalidTtl));
             assert_eq!(
@@ -422,9 +422,19 @@ mod tests {
     #[tokio::test]
     async fn outages_surface_as_sanitized_errors() {
         let cache = offline().await;
-        let error = cache.incr(&key(), Duration::from_secs(5)).await.unwrap_err();
+        let error = cache
+            .incr(&key(), Duration::from_secs(5))
+            .await
+            .unwrap_err();
         assert!(!error.to_string().contains("127.0.0.1"));
-        assert!(cache.atomic(|pipe| { pipe.cmd("PING"); }).await.is_err());
+        assert!(
+            cache
+                .atomic(|pipe| {
+                    pipe.cmd("PING");
+                })
+                .await
+                .is_err()
+        );
         assert!(cache.eval::<i64>("return 1", &[], &[]).await.is_err());
     }
 
@@ -480,7 +490,10 @@ mod tests {
 
             assert_eq!(cache.get_json::<Vec<u8>>(&key).await.unwrap(), None);
             assert!(cache.set_json(&key, &vec![1_u8, 2], ttl).await.unwrap());
-            assert_eq!(cache.get_json::<Vec<u8>>(&key).await.unwrap(), Some(vec![1, 2]));
+            assert_eq!(
+                cache.get_json::<Vec<u8>>(&key).await.unwrap(),
+                Some(vec![1, 2])
+            );
 
             cache.set(&key, "{not json", ttl).await.unwrap();
             assert_eq!(cache.get_json::<Vec<u8>>(&key).await.unwrap(), None);
@@ -495,10 +508,14 @@ mod tests {
             let calls = std::sync::atomic::AtomicUsize::new(0);
             for _ in 0..2 {
                 let value: Result<u8, ()> = cache
-                    .get_or_load(&key, |_| Duration::from_secs(30), || async {
-                        calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                        Ok(9)
-                    })
+                    .get_or_load(
+                        &key,
+                        |_| Duration::from_secs(30),
+                        || async {
+                            calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                            Ok(9)
+                        },
+                    )
                     .await;
                 assert_eq!(value, Ok(9));
             }
@@ -515,7 +532,10 @@ mod tests {
             assert_eq!(cache.get(&a).await.unwrap().as_deref(), Some("1"));
             assert_eq!(cache.get(&b).await.unwrap().as_deref(), Some("2"));
             assert_eq!(
-                cache.eval::<i64>("return #KEYS", &[&a, &b], &[]).await.unwrap(),
+                cache
+                    .eval::<i64>("return #KEYS", &[&a, &b], &[])
+                    .await
+                    .unwrap(),
                 2
             );
             cache.delete_many(&[&key, &a, &b]).await.unwrap();
