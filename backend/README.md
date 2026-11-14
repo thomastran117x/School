@@ -113,6 +113,12 @@ Configuration comes from environment variables. For local Cargo runs, `dotenvy` 
 | `CORS_ALLOWED_HEADERS` | No | `authorization,content-type,x-request-id` | Request headers allowed cross-origin |
 | `CORS_ALLOW_CREDENTIALS` | No | `false` | Allow credentialed CORS; never combined with a wildcard origin |
 | `CORS_MAX_AGE_SECS` | No | `600` | Preflight cache lifetime |
+| `RATE_LIMIT_ENABLED` | No | `true` | Master switch for rate limiting (a startup warning is logged when off) |
+| `RATE_LIMIT_GENERAL_IP_CAPACITY` / `_REFILL_PER_MINUTE` | No | `120` / `120` | Per-IP burst size and refill rate for all traffic |
+| `RATE_LIMIT_AUTH_IP_CAPACITY` / `_REFILL_PER_MINUTE` | No | `10` / `6` | Per-IP limit for authentication routes; may not exceed the general limit |
+| `RATE_LIMIT_AUTH_ACCOUNT_CAPACITY` / `_REFILL_PER_MINUTE` | No | `5` / `1` | Per-account limit for authentication attempts |
+| `RATE_LIMIT_FALLBACK_MAX_ENTRIES` | No | `10000` | Cap on in-process buckets used while Redis is down |
+| `TRUSTED_PROXY_CIDRS` | No | empty | Proxy IPs/CIDRs whose `X-Forwarded-For` is trusted; empty trusts no header |
 | `METRICS_ENABLED` | No | `true` | Start the Prometheus metrics listener |
 | `METRICS_ADDR` | No | `127.0.0.1:9090` | Metrics listener address; must differ from the API address |
 | `METRICS_BEARER_TOKEN` | When `METRICS_ADDR` is not loopback | unset | Bearer token scrapers must send; never logged |
@@ -120,11 +126,21 @@ Configuration comes from environment variables. For local Cargo runs, `dotenvy` 
 ### HTTP hardening, errors and logging
 
 - **Security headers:** every response carries `X-Content-Type-Options: nosniff`, `Referrer-Policy: no-referrer` and `X-Frame-Options: DENY`; `Strict-Transport-Security` is added only when `HTTP_HTTPS_ENABLED=true`. No `Server`/`X-Powered-By` header is set. **Content-Security-Policy is the frontend's responsibility**: this API returns JSON, so the Next.js app that serves HTML must set its own CSP.
-- **Errors:** failures use `AppError` and return `{"error": {"code", "message", "request_id"}}` with 400/401/403/404/405/409/413/422/500. 422 responses (`validation_failed`) add a `fields` array of `{field, code, message}`; malformed input (bad JSON, wrong content type, bad query/path) is 400 `validation_error`. Use the `ValidatedJson`/`ValidatedQuery`/`ValidatedPath` extractors in `crates/api/src/extract/` with `serde` + `validator` DTOs (shared length limits and rules in `extract/rules.rs`); the body size limit is `HTTP_MAX_BODY_BYTES`. Internal errors are logged server-side and never returned. Unknown routes, wrong methods and oversized bodies use the same body.
+- **Errors:** failures use `AppError` and return `{"error": {"code", "message", "request_id"}}` with 400/401/403/404/405/409/413/422/429/500/503. 422 responses (`validation_failed`) add a `fields` array of `{field, code, message}`; malformed input (bad JSON, wrong content type, bad query/path) is 400 `validation_error`. Use the `ValidatedJson`/`ValidatedQuery`/`ValidatedPath` extractors in `crates/api/src/extract/` with `serde` + `validator` DTOs (shared length limits and rules in `extract/rules.rs`); the body size limit is `HTTP_MAX_BODY_BYTES`. Internal errors are logged server-side and never returned. Unknown routes, wrong methods and oversized bodies use the same body.
 - **Request IDs:** every response carries `x-request-id`. A client-supplied value is kept only if it is 1-64 characters of `A-Z a-z 0-9 - _ .`; otherwise a fresh UUID is generated. The ID is also in the span and in error bodies.
 - **Logging:** one `tracing` subscriber is installed at startup. Request spans record only method, route template (for example `/health/live`, or `unmatched` when no route matched; raw paths are never logged) and request ID, and the response event adds status and latency (no headers, bodies or query strings). Fields whose names contain `authorization`, `cookie`, `token`, `password`, `secret`, `email`, `student` and similar are logged as `[REDACTED]`; redaction is name-based, so never interpolate secrets into a log message.
 
 The example environment explicitly disables MySQL TLS only for the localhost/isolated Compose development service. When the mode is omitted, the API and migration CLI require TLS with certificate and hostname verification. `verify_ca` verifies the certificate chain without checking the hostname; `required` encrypts transport without authenticating the server; `preferred` can fall back to plaintext. Configure TLS only through the dedicated variables; `DATABASE_URL` must not contain `ssl-mode` or `ssl-ca`. A supplied CA path must identify a readable file and is accepted only by a verifying mode. If the API runs in a container, mount that file and configure its container path.
+
+### Rate limiting
+
+Code: `crates/api/src/middleware/rate_limit/`. Each client IP (and, on auth routes, each account) owns a token bucket in Redis, updated by one atomic Lua script, so limits hold across every replica. A bucket allows a burst of `capacity` and refills continuously; idle buckets expire. Redis keys are `app:v1:ratelimit:<sha256>`, so raw IPs and account names never reach Redis, logs or metrics. Redis supplies the clock (`TIME`), so replica clock skew is irrelevant.
+
+- **Responses:** `429` (`rate_limited`) with `Retry-After` in whole seconds (rounded up, at least 1). `Retry-After` is exposed to cross-origin callers. `/health/*` is exempt.
+- **Policies:** `general_ip` applies to every request. `auth_ip` (per IP) and `auth_account` (per normalised account) are stricter and are applied by authentication routes: add `route_layer(from_fn_with_state(limiter.ip_limit(policies.auth_ip), limit_by_ip))` and call `limiter.check_account(&policies.auth_account, email)` after the body is validated (extractors consume the body, so a layer cannot see the account).
+- **Failure policy:** auth policies **fail closed** (`503` `rate_limit_unavailable` with `Retry-After`) when Redis errors or times out; this is not configurable and is never silent. The general policy degrades to a bounded in-process limiter (`RATE_LIMIT_FALLBACK_MAX_ENTRIES`; each replica enforces independently, so the cluster-wide limit is looser during an outage). When the table is full, new subjects are refused rather than evicting existing buckets, so a key flood cannot reset limits. Outages log at most one warning per 10 seconds.
+- **Trusted client IP:** the TCP peer is used by default. `X-Forwarded-For` is read only when the peer is in `TRUSTED_PROXY_CIDRS`, and then from the right: trusted hops are skipped and the first untrusted address is the client. Entries to its left are client-controlled and ignored. Malformed, oversized (over 2 KiB) or long (over 32 hops) headers fall back to the peer, which shares the proxy's bucket (strict). `X-Real-IP` and `Forwarded` are never read. IPv6 clients are bucketed per /64 and IPv4-mapped addresses are unwrapped. **Leave `TRUSTED_PROXY_CIDRS` empty unless every request reaches the API through proxies you control** and that overwrite or append to `X-Forwarded-For`; otherwise clients can spoof their address. If the proxy hides client addresses entirely, all traffic shares one bucket.
+- **Metrics:** `rate_limit_decisions_total{policy,outcome}`, `rate_limiter_redis_errors_total{kind}` and `rate_limiter_redis_duration_seconds`. See below.
 
 ### Metrics and observability
 
@@ -138,6 +154,9 @@ Metrics use the `metrics` facade with a per-process Prometheus recorder (`crates
 | `http_request_duration_seconds` | histogram | `method`, `route`, `status_class` |
 | `http_request_errors_total` | counter (4xx/5xx) | `route`, `status_class` |
 | `http_requests_in_flight` | gauge | none |
+| `rate_limit_decisions_total` | counter | `policy`, `outcome` (`allowed`, `limited`, `fallback_allowed`, `fallback_limited`, `fail_closed`) |
+| `rate_limiter_redis_errors_total` | counter | `kind` (`unavailable`, `timeout`, `failed`) |
+| `rate_limiter_redis_duration_seconds` | histogram | none |
 | `dependency_up` | gauge (1 up, 0 down) | `dependency` = `mysql`, `redis`, `opensearch` |
 | `dependency_probe_duration_seconds` | histogram | `dependency` |
 | `dependency_probe_failures_total` | counter | `dependency` |

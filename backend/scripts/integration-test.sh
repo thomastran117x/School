@@ -131,6 +131,9 @@ cargo test --locked -p backend-api --bin backend-api \
     features::courses::cache::tests::integration:: \
     -- --ignored
 
+echo "Checking the distributed rate limiter (bursts, refill, expiry, atomicity, replicas)."
+cargo test --locked -p backend-api --bin backend-api     middleware::rate_limit::limiter::tests::integration::     -- --ignored
+
 echo "Starting the backend API."
 cargo build --locked -p backend-api
 ./target/debug/backend-api >"${API_LOG}" 2>&1 &
@@ -167,6 +170,24 @@ grep -q 'dependency_up{dependency="redis"} 1' "${RESPONSE_BODY}"
 grep -q 'dependency_up{dependency="opensearch"} 1' "${RESPONSE_BODY}"
 grep -q 'http_requests_total{method="GET",route="/health/live",status="200"}' "${RESPONSE_BODY}"
 
+echo "Verifying the general per-IP limit returns 429 with Retry-After."
+rate_limited=0
+for _ in $(seq 1 400); do
+    code="$(curl --silent --output /dev/null --dump-header "${TEST_TMP_DIR}/headers"         --write-out '%{http_code}' "http://127.0.0.1:${APP_PORT}/rate-limit-probe" || true)"
+    if [[ "${code}" == "429" ]]; then
+        rate_limited=1
+        break
+    fi
+done
+if [[ "${rate_limited}" != "1" ]]; then
+    echo "Expected the general rate limit to return 429." >&2
+    exit 1
+fi
+grep -qi '^retry-after: [1-9]' "${TEST_TMP_DIR}/headers"
+scrape_metrics
+grep -q 'rate_limit_decisions_total{policy="general_ip",outcome="limited"}' "${RESPONSE_BODY}"
+grep -q 'rate_limiter_redis_duration_seconds_count' "${RESPONSE_BODY}"
+
 echo "Verifying degraded readiness when Redis is unavailable."
 docker compose stop redis
 wait_for_status \
@@ -179,6 +200,15 @@ grep -q '"opensearch":"up"' "${RESPONSE_BODY}"
 scrape_metrics
 grep -q 'dependency_up{dependency="redis"} 0' "${RESPONSE_BODY}"
 grep -q 'dependency_probe_failures_total{dependency="redis"}' "${RESPONSE_BODY}"
+
+echo "Verifying general traffic degrades to the local limiter while Redis is down."
+if [[ "$(request_status "http://127.0.0.1:${APP_PORT}/rate-limit-probe")" != "404" ]]; then
+    echo "Expected the local fallback to admit a request while Redis is down." >&2
+    exit 1
+fi
+scrape_metrics
+grep -q 'rate_limit_decisions_total{policy="general_ip",outcome="fallback_allowed"}' "${RESPONSE_BODY}"
+grep -q 'rate_limiter_redis_errors_total{kind=' "${RESPONSE_BODY}"
 
 echo "Verifying readiness recovery after Redis restarts."
 docker compose start redis

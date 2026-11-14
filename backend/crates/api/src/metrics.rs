@@ -60,6 +60,9 @@ const REQUESTS_IN_FLIGHT: &str = "http_requests_in_flight";
 const DEPENDENCY_UP: &str = "dependency_up";
 const PROBE_DURATION: &str = "dependency_probe_duration_seconds";
 const PROBE_FAILURES: &str = "dependency_probe_failures_total";
+const RATE_LIMIT_DECISIONS: &str = "rate_limit_decisions_total";
+const LIMITER_REDIS_ERRORS: &str = "rate_limiter_redis_errors_total";
+const LIMITER_REDIS_DURATION: &str = "rate_limiter_redis_duration_seconds";
 
 /// Handle for recording and rendering application metrics.
 ///
@@ -117,10 +120,25 @@ impl Metrics {
                 None,
                 "Dependency health probes that failed or timed out.",
             ),
+            (
+                RATE_LIMIT_DECISIONS,
+                None,
+                "Rate-limit decisions by policy and outcome (allowed, limited, fallback_allowed, fallback_limited, fail_closed).",
+            ),
+            (
+                LIMITER_REDIS_ERRORS,
+                None,
+                "Rate limiter Redis failures by kind (unavailable, timeout, failed).",
+            ),
+            (
+                LIMITER_REDIS_DURATION,
+                Some(Unit::Seconds),
+                "Latency of rate limiter Redis calls, successful or not.",
+            ),
         ] {
             let help = SharedString::from(help);
             match name {
-                REQUEST_DURATION | PROBE_DURATION => {
+                REQUEST_DURATION | PROBE_DURATION | LIMITER_REDIS_DURATION => {
                     recorder.describe_histogram(name.into(), unit, help);
                 }
                 REQUESTS_IN_FLIGHT | DEPENDENCY_UP => {
@@ -205,6 +223,31 @@ impl Metrics {
                     &key(PROBE_FAILURES, [("dependency", dependency)]),
                     &METADATA,
                 )
+                .increment(1);
+        }
+    }
+
+    /// Counts one rate-limit decision. Both arguments must come from fixed sets.
+    pub(crate) fn record_rate_limit(&self, policy: &'static str, outcome: &'static str) {
+        self.recorder
+            .register_counter(
+                &key(
+                    RATE_LIMIT_DECISIONS,
+                    [("policy", policy), ("outcome", outcome)],
+                ),
+                &METADATA,
+            )
+            .increment(1);
+    }
+
+    /// Records one limiter Redis call: its latency, and its error kind if it failed.
+    pub(crate) fn record_limiter_redis(&self, seconds: f64, error: Option<&'static str>) {
+        self.recorder
+            .register_histogram(&key(LIMITER_REDIS_DURATION, []), &METADATA)
+            .record(seconds);
+        if let Some(kind) = error {
+            self.recorder
+                .register_counter(&key(LIMITER_REDIS_ERRORS, [("kind", kind)]), &METADATA)
                 .increment(1);
         }
     }

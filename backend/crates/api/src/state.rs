@@ -25,6 +25,7 @@ use crate::{
     },
     infrastructure::{DatabaseClient, RedisClient},
     metrics::Metrics,
+    middleware::rate_limit::RateLimiter,
 };
 
 #[derive(Clone)]
@@ -51,6 +52,8 @@ pub struct AppState {
     pub(crate) course_cache: Arc<CourseCache>,
     /// Prometheus recorder shared by the request middleware and the metrics listener.
     pub(crate) metrics: Metrics,
+    /// Distributed rate limiter shared by the global layer and auth routes.
+    pub(crate) rate_limiter: RateLimiter,
 }
 
 /// Named inputs for [`AppState::from_parts`].
@@ -73,6 +76,8 @@ pub(crate) struct AppStateParts {
     pub(crate) course_cache: Arc<CourseCache>,
     /// Prometheus metrics recorder.
     pub(crate) metrics: Metrics,
+    /// Rate limiter.
+    pub(crate) rate_limiter: RateLimiter,
 }
 
 impl AppState {
@@ -87,6 +92,7 @@ impl AppState {
             refresh_sessions: parts.refresh_sessions,
             course_cache: parts.course_cache,
             metrics: parts.metrics,
+            rate_limiter: parts.rate_limiter,
         }
     }
 }
@@ -122,8 +128,8 @@ pub(crate) mod test_support {
     use super::{AppState, AppStateParts};
     use crate::{
         config::{
-            AuthSettings, CourseCacheSettings, DatabaseSettings, DatabaseTlsMode, RedisSettings,
-            RedisTlsMode, Settings,
+            AuthSettings, CourseCacheSettings, DatabaseSettings, DatabaseTlsMode,
+            RateLimitSettings, RedisSettings, RedisTlsMode, Settings,
         },
         features::{
             auth::refresh_store::RedisRefreshSessionStore, courses::cache::CourseCache,
@@ -131,6 +137,7 @@ pub(crate) mod test_support {
         },
         infrastructure::{DatabaseClient, RedisClient},
         metrics::Metrics,
+        middleware::rate_limit::RateLimiter,
     };
 
     /// Builds state backed by lazy clients that never connect, using `health` as the
@@ -177,15 +184,27 @@ pub(crate) mod test_support {
             redis.clone(),
             CourseCacheSettings::default(),
         ));
+        let settings = Settings::for_tests();
+        let metrics = Metrics::new().expect("fixed metric buckets are valid");
+        // Effectively unlimited so unrelated router tests are never throttled.
+        let rate_limiter = RateLimiter::new(
+            redis.clone(),
+            metrics.clone(),
+            &RateLimitSettings {
+                enabled: false,
+                ..settings.rate_limit.clone()
+            },
+        );
         AppState::from_parts(AppStateParts {
-            config: Arc::new(Settings::for_tests()),
+            config: Arc::new(settings),
             database,
             redis,
             opensearch,
             health,
             refresh_sessions,
             course_cache,
-            metrics: Metrics::new().expect("fixed metric buckets are valid"),
+            metrics,
+            rate_limiter,
         })
     }
 }

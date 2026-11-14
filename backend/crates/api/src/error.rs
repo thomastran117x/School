@@ -13,9 +13,11 @@
 //! are safe to show to a client may be placed in [`AppError::Validation`] and
 //! [`AppError::Conflict`].
 
+use std::time::Duration;
+
 use axum::{
     Json,
-    http::StatusCode,
+    http::{HeaderValue, StatusCode, header},
     response::{IntoResponse, Response},
 };
 use serde::Serialize;
@@ -52,6 +54,19 @@ pub enum AppError {
     /// The request body exceeded the configured limit.
     #[error("payload too large")]
     PayloadTooLarge,
+    /// The caller exceeded a rate limit; `Retry-After` is sent.
+    #[error("too many requests")]
+    TooManyRequests {
+        /// How long the caller should wait before retrying.
+        retry_after: Duration,
+    },
+    /// A protected route could not be evaluated safely (for example the rate limiter's
+    /// datastore is down) and is refusing traffic; `Retry-After` is sent.
+    #[error("service unavailable")]
+    ServiceUnavailable {
+        /// How long the caller should wait before retrying.
+        retry_after: Duration,
+    },
     /// An unexpected server-side failure. Only a static diagnostic is carried, so no
     /// runtime data (URLs, credentials, student data) can reach the logs or the client.
     #[error("internal server error: {0}")]
@@ -112,6 +127,8 @@ impl AppError {
             Self::MethodNotAllowed => StatusCode::METHOD_NOT_ALLOWED,
             Self::Conflict(_) => StatusCode::CONFLICT,
             Self::PayloadTooLarge => StatusCode::PAYLOAD_TOO_LARGE,
+            Self::TooManyRequests { .. } => StatusCode::TOO_MANY_REQUESTS,
+            Self::ServiceUnavailable { .. } => StatusCode::SERVICE_UNAVAILABLE,
             Self::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
         }
     }
@@ -127,6 +144,8 @@ impl AppError {
             Self::MethodNotAllowed => "method_not_allowed",
             Self::Conflict(_) => "conflict",
             Self::PayloadTooLarge => "payload_too_large",
+            Self::TooManyRequests { .. } => "rate_limited",
+            Self::ServiceUnavailable { .. } => "rate_limit_unavailable",
             Self::Internal(_) => "internal_error",
         }
     }
@@ -141,7 +160,24 @@ impl AppError {
             Self::NotFound => "resource not found",
             Self::MethodNotAllowed => "method not allowed",
             Self::PayloadTooLarge => "request body is too large",
+            Self::TooManyRequests { .. } => "too many requests; retry later",
+            Self::ServiceUnavailable { .. } => "service temporarily unavailable; retry later",
             Self::Internal(_) => "internal server error",
+        }
+    }
+
+    /// Returns the `Retry-After` delay in whole seconds (at least one), if any.
+    fn retry_after_seconds(&self) -> Option<u64> {
+        match self {
+            Self::TooManyRequests { retry_after } | Self::ServiceUnavailable { retry_after } => {
+                Some(
+                    retry_after
+                        .as_secs()
+                        .saturating_add(u64::from(retry_after.subsec_nanos() > 0))
+                        .max(1),
+                )
+            }
+            _ => None,
         }
     }
 }
@@ -163,7 +199,14 @@ impl IntoResponse for AppError {
                 },
             },
         };
-        (self.status(), Json(body)).into_response()
+        let retry_after = self.retry_after_seconds();
+        let mut response = (self.status(), Json(body)).into_response();
+        if let Some(seconds) = retry_after {
+            response
+                .headers_mut()
+                .insert(header::RETRY_AFTER, HeaderValue::from(seconds));
+        }
+        response
     }
 }
 
@@ -217,6 +260,20 @@ mod tests {
                 "payload_too_large",
             ),
             (
+                AppError::TooManyRequests {
+                    retry_after: Duration::from_millis(1500),
+                },
+                StatusCode::TOO_MANY_REQUESTS,
+                "rate_limited",
+            ),
+            (
+                AppError::ServiceUnavailable {
+                    retry_after: Duration::from_secs(5),
+                },
+                StatusCode::SERVICE_UNAVAILABLE,
+                "rate_limit_unavailable",
+            ),
+            (
                 AppError::internal("boom"),
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "internal_error",
@@ -228,6 +285,37 @@ mod tests {
             assert_eq!(status, expected_status);
             assert_eq!(body["error"]["code"], expected_code);
         }
+    }
+
+    #[test]
+    fn retry_after_rounds_up_and_is_only_set_for_throttling_errors() {
+        let header = |error: AppError| {
+            error
+                .into_response()
+                .headers()
+                .get(header::RETRY_AFTER)
+                .map(|value| value.to_str().unwrap().to_owned())
+        };
+        let ms = |ms| Duration::from_millis(ms);
+        assert_eq!(
+            header(AppError::TooManyRequests {
+                retry_after: ms(1500)
+            })
+            .as_deref(),
+            Some("2")
+        );
+        assert_eq!(
+            header(AppError::TooManyRequests { retry_after: ms(1) }).as_deref(),
+            Some("1")
+        );
+        assert_eq!(
+            header(AppError::ServiceUnavailable {
+                retry_after: ms(5000)
+            })
+            .as_deref(),
+            Some("5")
+        );
+        assert_eq!(header(AppError::NotFound), None);
     }
 
     #[tokio::test]

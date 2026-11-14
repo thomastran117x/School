@@ -42,6 +42,56 @@ pub struct Settings {
     pub http: HttpSettings,
     /// Metrics listener settings.
     pub metrics: MetricsSettings,
+    /// Rate-limit policies and trusted proxy ranges.
+    pub rate_limit: RateLimitSettings,
+}
+
+/// Token-bucket size and refill rate for one policy.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BucketSettings {
+    /// Largest burst allowed.
+    pub capacity: u32,
+    /// Tokens refilled per minute.
+    pub refill_per_minute: u32,
+}
+
+/// Rate-limiting settings. Auth policies always fail closed; that is not configurable.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RateLimitSettings {
+    /// Master switch. Disabling removes all throttling, including on auth routes.
+    pub enabled: bool,
+    /// Proxy ranges whose `X-Forwarded-For` is trusted. Empty means never trust it.
+    pub trusted_proxies: Vec<crate::middleware::rate_limit::cidr::Cidr>,
+    /// Per-IP limit for all traffic.
+    pub general_ip: BucketSettings,
+    /// Per-IP limit for authentication routes.
+    pub auth_ip: BucketSettings,
+    /// Per-account limit for authentication attempts.
+    pub auth_account: BucketSettings,
+    /// Maximum buckets held by the in-process fallback while Redis is down.
+    pub fallback_max_entries: usize,
+}
+
+impl Default for RateLimitSettings {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            trusted_proxies: Vec::new(),
+            general_ip: BucketSettings {
+                capacity: 120,
+                refill_per_minute: 120,
+            },
+            auth_ip: BucketSettings {
+                capacity: 10,
+                refill_per_minute: 6,
+            },
+            auth_account: BucketSettings {
+                capacity: 5,
+                refill_per_minute: 1,
+            },
+            fallback_max_entries: 10_000,
+        }
+    }
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -482,6 +532,7 @@ impl Settings {
             service_name: optional(&get, "SERVICE_NAME", "school-api"),
             http: http_settings(&get)?,
             metrics: metrics_settings(&get)?,
+            rate_limit: rate_limit_settings(&get)?,
         };
 
         let server_address = settings.server_address()?;
@@ -521,6 +572,83 @@ fn metrics_settings(get: &impl Fn(&str) -> Option<String>) -> Result<MetricsSett
         enabled,
         address,
         bearer_token,
+    })
+}
+
+/// Loads and validates rate-limit settings.
+///
+/// Authentication limits may not be looser than the general limit, so a typo cannot
+/// leave login less protected than ordinary traffic.
+fn rate_limit_settings(
+    get: &impl Fn(&str) -> Option<String>,
+) -> Result<RateLimitSettings, ConfigError> {
+    let defaults = RateLimitSettings::default();
+    let bucket = |capacity_key: &'static str,
+                  refill_key: &'static str,
+                  default: BucketSettings|
+     -> Result<BucketSettings, ConfigError> {
+        let capacity: u32 = parse(get, capacity_key, &default.capacity.to_string())?;
+        let refill_per_minute: u32 =
+            parse(get, refill_key, &default.refill_per_minute.to_string())?;
+        if !(1..=100_000).contains(&capacity) {
+            return Err(ConfigError::InvalidValue {
+                key: capacity_key,
+                value: capacity.to_string(),
+            });
+        }
+        if !(1..=600_000).contains(&refill_per_minute) {
+            return Err(ConfigError::InvalidValue {
+                key: refill_key,
+                value: refill_per_minute.to_string(),
+            });
+        }
+        Ok(BucketSettings {
+            capacity,
+            refill_per_minute,
+        })
+    };
+    let general_ip = bucket(
+        "RATE_LIMIT_GENERAL_IP_CAPACITY",
+        "RATE_LIMIT_GENERAL_IP_REFILL_PER_MINUTE",
+        defaults.general_ip,
+    )?;
+    let auth_ip = bucket(
+        "RATE_LIMIT_AUTH_IP_CAPACITY",
+        "RATE_LIMIT_AUTH_IP_REFILL_PER_MINUTE",
+        defaults.auth_ip,
+    )?;
+    let auth_account = bucket(
+        "RATE_LIMIT_AUTH_ACCOUNT_CAPACITY",
+        "RATE_LIMIT_AUTH_ACCOUNT_REFILL_PER_MINUTE",
+        defaults.auth_account,
+    )?;
+    if auth_ip.capacity > general_ip.capacity
+        || auth_ip.refill_per_minute > general_ip.refill_per_minute
+    {
+        return Err(ConfigError::AuthRateLimitLooserThanGeneral);
+    }
+    let fallback_max_entries: usize = parse(get, "RATE_LIMIT_FALLBACK_MAX_ENTRIES", "10000")?;
+    if !(1..=1_000_000).contains(&fallback_max_entries) {
+        return Err(ConfigError::InvalidValue {
+            key: "RATE_LIMIT_FALLBACK_MAX_ENTRIES",
+            value: fallback_max_entries.to_string(),
+        });
+    }
+    let trusted_proxies = csv(get("TRUSTED_PROXY_CIDRS"))
+        .into_iter()
+        .map(|value| {
+            value
+                .parse()
+                .map_err(|_| ConfigError::InvalidTrustedProxy(value))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(RateLimitSettings {
+        enabled: parse_bool(get, "RATE_LIMIT_ENABLED", "true")?,
+        trusted_proxies,
+        general_ip,
+        auth_ip,
+        auth_account,
+        fallback_max_entries,
     })
 }
 
@@ -782,6 +910,12 @@ pub enum ConfigError {
     /// The refresh family lifetime was shorter than the refresh token lifetime.
     #[error("REFRESH_FAMILY_MAX_LIFETIME_SECONDS must be at least REFRESH_TOKEN_TTL_SECONDS")]
     InvalidAuthLifetimes,
+    /// `TRUSTED_PROXY_CIDRS` contained an entry that is not an IP or CIDR range.
+    #[error("TRUSTED_PROXY_CIDRS contains an invalid address or range: {0:?}")]
+    InvalidTrustedProxy(String),
+    /// The authentication rate limit was configured looser than the general limit.
+    #[error("RATE_LIMIT_AUTH_IP_* must not be looser than RATE_LIMIT_GENERAL_IP_*")]
+    AuthRateLimitLooserThanGeneral,
     /// The list or negative cache TTL exceeded the detail cache TTL.
     #[error(
         "COURSE_CACHE_LIST_TTL_SECONDS and COURSE_CACHE_NEGATIVE_TTL_SECONDS must not exceed COURSE_CACHE_DETAIL_TTL_SECONDS"
@@ -850,6 +984,49 @@ mod tests {
             loaded.auth.refresh_family_max_lifetime,
             Duration::from_secs(30 * 24 * 60 * 60)
         );
+    }
+
+    #[test]
+    fn rate_limit_defaults_are_strict_for_auth_and_trust_no_proxy() {
+        let loaded = settings(&required_values()).unwrap();
+        let limits = &loaded.rate_limit;
+        assert_eq!(*limits, RateLimitSettings::default());
+        assert!(limits.enabled);
+        assert!(limits.trusted_proxies.is_empty());
+        assert!(limits.auth_ip.capacity < limits.general_ip.capacity);
+    }
+
+    #[test]
+    fn rate_limit_settings_are_parsed_and_validated() {
+        let with = |extra: &[(&'static str, &'static str)]| {
+            let mut values = required_values();
+            values.extend_from_slice(extra);
+            settings(&values)
+        };
+        let loaded = with(&[
+            ("TRUSTED_PROXY_CIDRS", "10.0.0.0/8, fd00::/8"),
+            ("RATE_LIMIT_AUTH_ACCOUNT_CAPACITY", "3"),
+        ])
+        .unwrap();
+        assert_eq!(loaded.rate_limit.trusted_proxies.len(), 2);
+        assert_eq!(loaded.rate_limit.auth_account.capacity, 3);
+
+        assert_eq!(
+            with(&[("TRUSTED_PROXY_CIDRS", "10.0.0.0/33")]).err(),
+            Some(ConfigError::InvalidTrustedProxy("10.0.0.0/33".to_owned()))
+        );
+        assert!(matches!(
+            with(&[("RATE_LIMIT_GENERAL_IP_CAPACITY", "0")]),
+            Err(ConfigError::InvalidValue { .. })
+        ));
+        assert_eq!(
+            with(&[("RATE_LIMIT_AUTH_IP_CAPACITY", "500")]).err(),
+            Some(ConfigError::AuthRateLimitLooserThanGeneral)
+        );
+        assert!(matches!(
+            with(&[("RATE_LIMIT_FALLBACK_MAX_ENTRIES", "0")]),
+            Err(ConfigError::InvalidValue { .. })
+        ));
     }
 
     #[test]
