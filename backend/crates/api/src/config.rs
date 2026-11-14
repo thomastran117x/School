@@ -32,6 +32,103 @@ pub struct Settings {
     pub health_check_timeout: Duration,
     /// [`tracing_subscriber::EnvFilter`] expression used by application telemetry.
     pub log_filter: String,
+    /// Deployment environment, which selects log format and is attached to log events.
+    pub environment: Environment,
+    /// Service name attached to every log event.
+    pub service_name: String,
+    /// HTTP hardening settings: CORS, body limits and security headers.
+    pub http: HttpSettings,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// Deployment environment of the running process.
+pub enum Environment {
+    /// Local development; logs are human-readable.
+    Development,
+    /// Pre-production deployment; logs are JSON.
+    Staging,
+    /// Production deployment; logs are JSON.
+    Production,
+}
+
+impl Environment {
+    /// Returns the lowercase name attached to log events.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Development => "development",
+            Self::Staging => "staging",
+            Self::Production => "production",
+        }
+    }
+}
+
+impl FromStr for Environment {
+    type Err = ();
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value.to_ascii_lowercase().as_str() {
+            "development" => Ok(Self::Development),
+            "staging" => Ok(Self::Staging),
+            "production" => Ok(Self::Production),
+            _ => Err(()),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+/// HTTP-layer hardening settings.
+pub struct HttpSettings {
+    /// Whether the public deployment is served over HTTPS (for example behind a
+    /// TLS-terminating proxy). `Strict-Transport-Security` is sent only when `true`.
+    pub https_enabled: bool,
+    /// `max-age` advertised in `Strict-Transport-Security`.
+    pub hsts_max_age: Duration,
+    /// Maximum accepted request body size in bytes.
+    pub max_body_bytes: usize,
+    /// Cross-origin resource sharing policy.
+    pub cors: CorsSettings,
+}
+
+impl Default for HttpSettings {
+    fn default() -> Self {
+        Self {
+            https_enabled: false,
+            hsts_max_age: Duration::from_secs(31_536_000),
+            max_body_bytes: 1024 * 1024,
+            cors: CorsSettings::default(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+/// Allowlist-based CORS policy. An empty origin list disables cross-origin access.
+pub struct CorsSettings {
+    /// Exact frontend origins (`scheme://host[:port]`) allowed to call the API.
+    pub allowed_origins: Vec<String>,
+    /// HTTP methods permitted on cross-origin requests.
+    pub allowed_methods: Vec<String>,
+    /// Request headers permitted on cross-origin requests.
+    pub allowed_headers: Vec<String>,
+    /// Whether browsers may send credentials. Never combined with a wildcard.
+    pub allow_credentials: bool,
+    /// How long browsers may cache a preflight response.
+    pub max_age: Duration,
+}
+
+impl Default for CorsSettings {
+    fn default() -> Self {
+        Self {
+            allowed_origins: Vec::new(),
+            allowed_methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"]
+                .map(str::to_owned)
+                .to_vec(),
+            allowed_headers: ["authorization", "content-type", "x-request-id"]
+                .map(str::to_owned)
+                .to_vec(),
+            allow_credentials: false,
+            max_age: Duration::from_secs(600),
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -200,6 +297,18 @@ impl Settings {
         Self::from_source(|key| env::var(key).ok())
     }
 
+    /// Builds valid settings from fixed local values, for tests in other modules.
+    #[cfg(test)]
+    pub(crate) fn for_tests() -> Self {
+        Self::from_source(|key| match key {
+            "DATABASE_URL" => Some("mysql://app:secret@localhost/app".to_owned()),
+            "REDIS_URL" => Some("rediss://localhost:6379".to_owned()),
+            "OPENSEARCH_URL" => Some("http://localhost:9200".to_owned()),
+            _ => None,
+        })
+        .expect("fixed test settings are valid")
+    }
+
     /// Loads settings from an abstract key-value source.
     ///
     /// Keeping parsing independent from process-global environment mutation makes the
@@ -327,6 +436,9 @@ impl Settings {
             course_cache,
             health_check_timeout: Duration::from_millis(health_check_timeout_ms),
             log_filter: optional(&get, "RUST_LOG", "backend_api=info,tower_http=info"),
+            environment: parse(&get, "APP_ENV", "production")?,
+            service_name: optional(&get, "SERVICE_NAME", "school-api"),
+            http: http_settings(&get)?,
         };
 
         settings.server_address()?;
@@ -347,6 +459,116 @@ impl Settings {
             }
         })
     }
+}
+
+/// Loads and validates HTTP hardening settings (CORS, body limit, HSTS).
+fn http_settings(get: &impl Fn(&str) -> Option<String>) -> Result<HttpSettings, ConfigError> {
+    let https_enabled = parse_bool(get, "HTTP_HTTPS_ENABLED", "false")?;
+    let hsts_seconds: u64 = parse(get, "HTTP_HSTS_MAX_AGE_SECS", "31536000")?;
+    let max_body_bytes: usize = parse(get, "HTTP_MAX_BODY_BYTES", "1048576")?;
+    if max_body_bytes == 0 {
+        return Err(ConfigError::ZeroDuration("HTTP_MAX_BODY_BYTES"));
+    }
+
+    let defaults = CorsSettings::default();
+    let allowed_origins = csv(get("CORS_ALLOWED_ORIGINS"))
+        .into_iter()
+        .map(|origin| normalize_origin(&origin))
+        .collect::<Result<Vec<_>, _>>()?;
+    let allowed_methods = match non_empty(get("CORS_ALLOWED_METHODS")) {
+        Some(value) => csv(Some(value))
+            .into_iter()
+            .map(|method| {
+                let method = method.to_ascii_uppercase();
+                axum::http::Method::from_bytes(method.as_bytes())
+                    .ok()
+                    .filter(|_| method != "*")
+                    .map(|_| method.clone())
+                    .ok_or(())
+                    .map_err(|_| ConfigError::InvalidValue {
+                        key: "CORS_ALLOWED_METHODS",
+                        value: method,
+                    })
+            })
+            .collect::<Result<Vec<_>, _>>()?,
+        None => defaults.allowed_methods,
+    };
+    let allowed_headers = match non_empty(get("CORS_ALLOWED_HEADERS")) {
+        Some(value) => csv(Some(value))
+            .into_iter()
+            .map(|header| {
+                axum::http::HeaderName::from_bytes(header.as_bytes())
+                    .ok()
+                    .filter(|_| header != "*")
+                    .map(|name| name.as_str().to_owned())
+                    .ok_or(())
+                    .map_err(|_| ConfigError::InvalidValue {
+                        key: "CORS_ALLOWED_HEADERS",
+                        value: header,
+                    })
+            })
+            .collect::<Result<Vec<_>, _>>()?,
+        None => defaults.allowed_headers,
+    };
+    let max_age_seconds: u64 = parse(get, "CORS_MAX_AGE_SECS", "600")?;
+
+    Ok(HttpSettings {
+        https_enabled,
+        hsts_max_age: Duration::from_secs(hsts_seconds),
+        max_body_bytes,
+        cors: CorsSettings {
+            allowed_origins,
+            allowed_methods,
+            allowed_headers,
+            allow_credentials: parse_bool(get, "CORS_ALLOW_CREDENTIALS", "false")?,
+            max_age: Duration::from_secs(max_age_seconds),
+        },
+    })
+}
+
+/// Parses a `true`/`false` flag from a configuration source.
+fn parse_bool(
+    get: &impl Fn(&str) -> Option<String>,
+    key: &'static str,
+    default: &str,
+) -> Result<bool, ConfigError> {
+    let value = optional(get, key, default);
+    match value.to_ascii_lowercase().as_str() {
+        "true" | "1" => Ok(true),
+        "false" | "0" => Ok(false),
+        _ => Err(ConfigError::InvalidValue { key, value }),
+    }
+}
+
+/// Splits a comma-separated value into trimmed, non-empty items.
+fn csv(value: Option<String>) -> Vec<String> {
+    value
+        .unwrap_or_default()
+        .split(',')
+        .map(str::trim)
+        .filter(|item| !item.is_empty())
+        .map(str::to_owned)
+        .collect()
+}
+
+/// Validates a CORS origin and returns its canonical `scheme://host[:port]` form.
+///
+/// Wildcards, paths, queries, fragments and credentials are rejected so the allowlist
+/// can only ever contain exact origins.
+fn normalize_origin(value: &str) -> Result<String, ConfigError> {
+    let invalid = || ConfigError::InvalidCorsOrigin(value.to_owned());
+    let url = Url::parse(value).map_err(|_| invalid())?;
+    if !matches!(url.scheme(), "http" | "https")
+        || url.host_str().is_none()
+        || !matches!(url.path(), "" | "/")
+        || url.query().is_some()
+        || url.fragment().is_some()
+        || !url.username().is_empty()
+        || url.password().is_some()
+    {
+        return Err(invalid());
+    }
+    Ok(url.origin().ascii_serialization())
 }
 
 /// Reads a required, non-blank value from a configuration source.
@@ -502,6 +724,9 @@ pub enum ConfigError {
         "COURSE_CACHE_LIST_TTL_SECONDS and COURSE_CACHE_NEGATIVE_TTL_SECONDS must not exceed COURSE_CACHE_DETAIL_TTL_SECONDS"
     )]
     InvalidCourseCacheTtls,
+    /// A CORS origin was not an exact `http(s)://host[:port]` origin (wildcards are never allowed).
+    #[error("CORS_ALLOWED_ORIGINS contains an invalid origin: {0:?}")]
+    InvalidCorsOrigin(String),
     /// The configured HTTP host and port did not form a valid socket address.
     #[error("APP_HOST {host:?} and APP_PORT {port} do not form a valid socket address")]
     InvalidSocketAddress {
@@ -610,6 +835,86 @@ mod tests {
             with(&[("COURSE_CACHE_LIST_TTL_SECONDS", "301")]),
             Some(ConfigError::InvalidCourseCacheTtls)
         );
+    }
+
+    #[test]
+    fn loads_secure_http_defaults() {
+        let loaded = settings(&required_values()).unwrap();
+
+        assert_eq!(loaded.environment, Environment::Production);
+        assert_eq!(loaded.service_name, "school-api");
+        assert_eq!(loaded.http, HttpSettings::default());
+        assert!(loaded.http.cors.allowed_origins.is_empty());
+        assert!(!loaded.http.cors.allow_credentials);
+        assert!(!loaded.http.https_enabled);
+    }
+
+    #[test]
+    fn loads_and_normalizes_cors_settings() {
+        let mut values = required_values();
+        values.extend([
+            ("APP_ENV", "Development"),
+            (
+                "CORS_ALLOWED_ORIGINS",
+                "http://localhost:3000/, https://app.example.com",
+            ),
+            ("CORS_ALLOWED_METHODS", "get,post"),
+            ("CORS_ALLOWED_HEADERS", "Content-Type"),
+            ("CORS_ALLOW_CREDENTIALS", "true"),
+            ("HTTP_HTTPS_ENABLED", "true"),
+            ("HTTP_MAX_BODY_BYTES", "2048"),
+        ]);
+
+        let loaded = settings(&values).unwrap();
+
+        assert_eq!(loaded.environment, Environment::Development);
+        assert_eq!(
+            loaded.http.cors.allowed_origins,
+            ["http://localhost:3000", "https://app.example.com"]
+        );
+        assert_eq!(loaded.http.cors.allowed_methods, ["GET", "POST"]);
+        assert_eq!(loaded.http.cors.allowed_headers, ["content-type"]);
+        assert!(loaded.http.cors.allow_credentials);
+        assert!(loaded.http.https_enabled);
+        assert_eq!(loaded.http.max_body_bytes, 2048);
+    }
+
+    #[test]
+    fn rejects_invalid_http_settings() {
+        let with = |extra: &[(&'static str, &'static str)]| {
+            let mut values = required_values();
+            values.extend_from_slice(extra);
+            settings(&values).err()
+        };
+
+        for origin in ["*", "https://app.example.com/path", "ftp://x.test", "nope"] {
+            assert_eq!(
+                with(&[("CORS_ALLOWED_ORIGINS", origin)]),
+                Some(ConfigError::InvalidCorsOrigin(origin.to_owned()))
+            );
+        }
+        assert_eq!(
+            with(&[("HTTP_MAX_BODY_BYTES", "0")]),
+            Some(ConfigError::ZeroDuration("HTTP_MAX_BODY_BYTES"))
+        );
+        assert!(matches!(
+            with(&[("APP_ENV", "qa")]),
+            Some(ConfigError::InvalidValue { key: "APP_ENV", .. })
+        ));
+        assert!(matches!(
+            with(&[("CORS_ALLOWED_HEADERS", "*")]),
+            Some(ConfigError::InvalidValue {
+                key: "CORS_ALLOWED_HEADERS",
+                ..
+            })
+        ));
+        assert!(matches!(
+            with(&[("CORS_ALLOW_CREDENTIALS", "maybe")]),
+            Some(ConfigError::InvalidValue {
+                key: "CORS_ALLOW_CREDENTIALS",
+                ..
+            })
+        ));
     }
 
     #[test]

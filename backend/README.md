@@ -102,6 +102,22 @@ Configuration comes from environment variables. For local Cargo runs, `dotenvy` 
 | `COURSE_CACHE_LIST_TTL_SECONDS` | No | `60` | Lifetime of a cached catalogue page; must not exceed the detail TTL |
 | `COURSE_CACHE_NEGATIVE_TTL_SECONDS` | No | `30` | Lifetime of a cached "course not found"; must not exceed the detail TTL |
 | `RUST_LOG` | No | `backend_api=info,tower_http=info` | Tracing filter |
+| `APP_ENV` | No | `production` | `development` (readable logs), `staging` or `production` (JSON logs) |
+| `SERVICE_NAME` | No | `school-api` | Service name attached to every log event |
+| `HTTP_HTTPS_ENABLED` | No | `false` | Set `true` when served over HTTPS (e.g. behind a TLS proxy) to send HSTS |
+| `HTTP_HSTS_MAX_AGE_SECS` | No | `31536000` | `max-age` of the HSTS header |
+| `HTTP_MAX_BODY_BYTES` | No | `1048576` | Maximum request body size; larger bodies get `413` |
+| `CORS_ALLOWED_ORIGINS` | No | empty | Comma-separated exact frontend origins; empty disables CORS; `*` and paths are rejected |
+| `CORS_ALLOWED_METHODS` | No | `GET,POST,PUT,PATCH,DELETE,OPTIONS` | Methods allowed cross-origin |
+| `CORS_ALLOWED_HEADERS` | No | `authorization,content-type,x-request-id` | Request headers allowed cross-origin |
+| `CORS_ALLOW_CREDENTIALS` | No | `false` | Allow credentialed CORS; never combined with a wildcard origin |
+| `CORS_MAX_AGE_SECS` | No | `600` | Preflight cache lifetime |
+
+### HTTP hardening, errors and logging
+
+- **Security headers:** every response carries `X-Content-Type-Options: nosniff`, `Referrer-Policy: no-referrer` and `X-Frame-Options: DENY`; `Strict-Transport-Security` is added only when `HTTP_HTTPS_ENABLED=true`. No `Server`/`X-Powered-By` header is set. **Content-Security-Policy is the frontend's responsibility**: this API returns JSON, so the Next.js app that serves HTML must set its own CSP.
+- **Errors:** failures use `AppError` and return `{"error": {"code", "message", "request_id"}}` with 400/401/403/404/405/409/413/500. Internal errors are logged server-side and never returned. Unknown routes, wrong methods and oversized bodies use the same body.
+- **Logging:** one `tracing` subscriber is installed at startup. Request spans record only method, path and request ID (no headers or query strings). Fields whose names contain `authorization`, `cookie`, `token`, `password`, `secret`, `email`, `student` and similar are logged as `[REDACTED]`; redaction is name-based, so never interpolate secrets into a log message.
 
 The example environment explicitly disables MySQL TLS only for the localhost/isolated Compose development service. When the mode is omitted, the API and migration CLI require TLS with certificate and hostname verification. `verify_ca` verifies the certificate chain without checking the hostname; `required` encrypts transport without authenticating the server; `preferred` can fall back to plaintext. Configure TLS only through the dedicated variables; `DATABASE_URL` must not contain `ssl-mode` or `ssl-ca`. A supplied CA path must identify a readable file and is accepted only by a verifying mode. If the API runs in a container, mount that file and configure its container path.
 

@@ -7,8 +7,10 @@
 
 mod app;
 mod config;
+mod error;
 mod features;
 mod infrastructure;
+mod middleware;
 mod shutdown;
 mod state;
 mod telemetry;
@@ -24,7 +26,7 @@ use state::AppState;
 /// Loads the application and serves HTTP requests until a shutdown signal arrives.
 async fn main() -> anyhow::Result<()> {
     let settings = config::Settings::from_env().context("failed to load configuration")?;
-    telemetry::init(&settings.log_filter).context("failed to initialize tracing")?;
+    telemetry::init(&settings).context("failed to initialize tracing")?;
 
     let datastores = Datastores::initialize(&settings)
         .await
@@ -39,7 +41,10 @@ async fn main() -> anyhow::Result<()> {
         datastores,
         settings.health_check_timeout,
     ));
-    let app = app::router(AppState::new(database, redis, health, refresh_sessions));
+    let app = app::router_with(
+        AppState::new(database, redis, health, refresh_sessions),
+        &settings.http,
+    );
 
     let bind_address = settings
         .server_address()
