@@ -113,6 +113,9 @@ Configuration comes from environment variables. For local Cargo runs, `dotenvy` 
 | `CORS_ALLOWED_HEADERS` | No | `authorization,content-type,x-request-id` | Request headers allowed cross-origin |
 | `CORS_ALLOW_CREDENTIALS` | No | `false` | Allow credentialed CORS; never combined with a wildcard origin |
 | `CORS_MAX_AGE_SECS` | No | `600` | Preflight cache lifetime |
+| `METRICS_ENABLED` | No | `true` | Start the Prometheus metrics listener |
+| `METRICS_ADDR` | No | `127.0.0.1:9090` | Metrics listener address; must differ from the API address |
+| `METRICS_BEARER_TOKEN` | When `METRICS_ADDR` is not loopback | unset | Bearer token scrapers must send; never logged |
 
 ### HTTP hardening, errors and logging
 
@@ -122,6 +125,61 @@ Configuration comes from environment variables. For local Cargo runs, `dotenvy` 
 - **Logging:** one `tracing` subscriber is installed at startup. Request spans record only method, route template (for example `/health/live`, or `unmatched` when no route matched; raw paths are never logged) and request ID, and the response event adds status and latency (no headers, bodies or query strings). Fields whose names contain `authorization`, `cookie`, `token`, `password`, `secret`, `email`, `student` and similar are logged as `[REDACTED]`; redaction is name-based, so never interpolate secrets into a log message.
 
 The example environment explicitly disables MySQL TLS only for the localhost/isolated Compose development service. When the mode is omitted, the API and migration CLI require TLS with certificate and hostname verification. `verify_ca` verifies the certificate chain without checking the hostname; `required` encrypts transport without authenticating the server; `preferred` can fall back to plaintext. Configure TLS only through the dedicated variables; `DATABASE_URL` must not contain `ssl-mode` or `ssl-ca`. A supplied CA path must identify a readable file and is accepted only by a verifying mode. If the API runs in a container, mount that file and configure its container path.
+
+### Metrics and observability
+
+Metrics use the `metrics` facade with a per-process Prometheus recorder (`crates/api/src/metrics.rs`).
+
+**Endpoint.** `GET /metrics` is served only on a dedicated listener (`METRICS_ADDR`, default `127.0.0.1:9090`), never on the public API port (which returns 404 for `/metrics`). The listener is loopback by default; binding any other address requires `METRICS_BEARER_TOKEN`, otherwise startup fails. When a token is set, scrapers must send `Authorization: Bearer <token>` (compared in constant time). Responses: `200` Prometheus text format, `401` with `WWW-Authenticate: Bearer` for a missing or wrong token, `404` for any other path. Scrapes are not counted in request metrics. The Compose `api` service binds `0.0.0.0:9090` inside the container with a token (default `local-dev-metrics-token`, override `METRICS_BEARER_TOKEN`) and does not publish the port. Keep it on a private network in real deployments.
+
+| Metric | Type | Labels |
+| --- | --- | --- |
+| `http_requests_total` | counter | `method`, `route`, `status` |
+| `http_request_duration_seconds` | histogram | `method`, `route`, `status_class` |
+| `http_request_errors_total` | counter (4xx/5xx) | `route`, `status_class` |
+| `http_requests_in_flight` | gauge | none |
+| `dependency_up` | gauge (1 up, 0 down) | `dependency` = `mysql`, `redis`, `opensearch` |
+| `dependency_probe_duration_seconds` | histogram | `dependency` |
+| `dependency_probe_failures_total` | counter | `dependency` |
+
+**Low cardinality.** `route` is the matched route template (for example `/health/live`) or `unmatched`; raw paths, path parameters, query strings and user or student IDs are never labels. `method` is a standard HTTP method or `OTHER`. When adding metrics, only use labels drawn from a fixed, small set.
+
+**Dependency health.** Each scrape runs the same readiness probes as `/health/ready` (bounded by `HEALTH_CHECK_TIMEOUT_MS`) and sets `dependency_up`, so a down datastore shows as `0` rather than failing the scrape. Probes also feed the duration and failure series.
+
+**Prometheus.**
+
+```yaml
+scrape_configs:
+  - job_name: school-api
+    metrics_path: /metrics
+    authorization:
+      type: Bearer
+      credentials_file: /etc/prometheus/school-api-token
+    static_configs:
+      - targets: ["api:9090"]
+```
+
+**OpenTelemetry.** The service exposes Prometheus metrics rather than exporting OTLP itself. Scrape it with an OpenTelemetry Collector and forward to any OTLP backend:
+
+```yaml
+receivers:
+  prometheus:
+    config:
+      scrape_configs:
+        - job_name: school-api
+          authorization:
+            credentials_file: /etc/otelcol/school-api-token
+          static_configs:
+            - targets: ["api:9090"]
+exporters:
+  otlphttp:
+    endpoint: https://otlp.example.com
+service:
+  pipelines:
+    metrics:
+      receivers: [prometheus]
+      exporters: [otlphttp]
+```
 
 ### Application state
 

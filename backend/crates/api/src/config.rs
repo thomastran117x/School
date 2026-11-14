@@ -40,6 +40,44 @@ pub struct Settings {
     pub service_name: String,
     /// HTTP hardening settings: CORS, body limits and security headers.
     pub http: HttpSettings,
+    /// Metrics listener settings.
+    pub metrics: MetricsSettings,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+/// Settings for the dedicated Prometheus metrics listener.
+///
+/// Its `Debug` output redacts the scrape token.
+pub struct MetricsSettings {
+    /// Whether the metrics listener is started.
+    pub enabled: bool,
+    /// Address of the metrics listener, separate from the public API address.
+    pub address: SocketAddr,
+    /// Bearer token scrapers must present. Required for non-loopback addresses.
+    pub bearer_token: Option<String>,
+}
+
+impl std::fmt::Debug for MetricsSettings {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MetricsSettings")
+            .field("enabled", &self.enabled)
+            .field("address", &self.address)
+            .field(
+                "bearer_token",
+                &self.bearer_token.as_ref().map(|_| "<redacted>"),
+            )
+            .finish()
+    }
+}
+
+impl Default for MetricsSettings {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            address: SocketAddr::from(([127, 0, 0, 1], 9090)),
+            bearer_token: None,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -443,9 +481,13 @@ impl Settings {
             environment: parse(&get, "APP_ENV", "production")?,
             service_name: optional(&get, "SERVICE_NAME", "school-api"),
             http: http_settings(&get)?,
+            metrics: metrics_settings(&get)?,
         };
 
-        settings.server_address()?;
+        let server_address = settings.server_address()?;
+        if settings.metrics.enabled && settings.metrics.address == server_address {
+            return Err(ConfigError::MetricsAddressConflict);
+        }
         Ok(settings)
     }
 
@@ -463,6 +505,23 @@ impl Settings {
             }
         })
     }
+}
+
+/// Loads and validates the metrics listener settings.
+///
+/// A non-loopback listener must be protected by `METRICS_BEARER_TOKEN`.
+fn metrics_settings(get: &impl Fn(&str) -> Option<String>) -> Result<MetricsSettings, ConfigError> {
+    let enabled = parse_bool(get, "METRICS_ENABLED", "true")?;
+    let address: SocketAddr = parse(get, "METRICS_ADDR", "127.0.0.1:9090")?;
+    let bearer_token = non_empty(get("METRICS_BEARER_TOKEN"));
+    if enabled && !address.ip().is_loopback() && bearer_token.is_none() {
+        return Err(ConfigError::MetricsTokenRequired);
+    }
+    Ok(MetricsSettings {
+        enabled,
+        address,
+        bearer_token,
+    })
 }
 
 /// Loads and validates HTTP hardening settings (CORS, body limit, HSTS).
@@ -731,6 +790,12 @@ pub enum ConfigError {
     /// A CORS origin was not an exact `http(s)://host[:port]` origin (wildcards are never allowed).
     #[error("CORS_ALLOWED_ORIGINS contains an invalid origin: {0:?}")]
     InvalidCorsOrigin(String),
+    /// A metrics listener reachable beyond loopback was configured without a token.
+    #[error("METRICS_BEARER_TOKEN is required when METRICS_ADDR is not a loopback address")]
+    MetricsTokenRequired,
+    /// The metrics listener was configured on the public API address.
+    #[error("METRICS_ADDR must differ from the public API address")]
+    MetricsAddressConflict,
     /// The configured HTTP host and port did not form a valid socket address.
     #[error("APP_HOST {host:?} and APP_PORT {port} do not form a valid socket address")]
     InvalidSocketAddress {
@@ -1126,5 +1191,49 @@ mod tests {
             settings(&values).err().unwrap(),
             ConfigError::IncompleteOpenSearchCredentials
         );
+    }
+
+    #[test]
+    fn loads_metrics_defaults_and_validates_exposure() {
+        let loaded = settings(&required_values()).unwrap();
+        assert_eq!(loaded.metrics, MetricsSettings::default());
+
+        let with = |extra: &[(&'static str, &'static str)]| {
+            let mut values = required_values();
+            values.extend_from_slice(extra);
+            settings(&values)
+        };
+        assert_eq!(
+            with(&[("METRICS_ADDR", "0.0.0.0:9090")]).err(),
+            Some(ConfigError::MetricsTokenRequired)
+        );
+        let exposed = with(&[
+            ("METRICS_ADDR", "0.0.0.0:9090"),
+            ("METRICS_BEARER_TOKEN", "token"),
+        ])
+        .unwrap();
+        assert_eq!(exposed.metrics.bearer_token.as_deref(), Some("token"));
+        assert!(
+            with(&[
+                ("METRICS_ADDR", "0.0.0.0:9090"),
+                ("METRICS_ENABLED", "false")
+            ])
+            .is_ok()
+        );
+        assert_eq!(
+            with(&[
+                ("APP_HOST", "127.0.0.1"),
+                ("METRICS_ADDR", "127.0.0.1:3000")
+            ])
+            .err(),
+            Some(ConfigError::MetricsAddressConflict)
+        );
+        assert!(matches!(
+            with(&[("METRICS_ADDR", "nope")]).err(),
+            Some(ConfigError::InvalidValue {
+                key: "METRICS_ADDR",
+                ..
+            })
+        ));
     }
 }

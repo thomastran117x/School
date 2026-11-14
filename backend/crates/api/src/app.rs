@@ -4,7 +4,11 @@
 //! the entire API.
 
 use axum::{
-    Router, extract::MatchedPath, http::HeaderName, middleware::from_fn, response::IntoResponse,
+    Router,
+    extract::MatchedPath,
+    http::HeaderName,
+    middleware::{from_fn, from_fn_with_state},
+    response::IntoResponse,
 };
 use tower_http::{
     LatencyUnit,
@@ -18,7 +22,7 @@ use tracing::{Level, Span};
 use crate::{
     config::HttpSettings,
     error::AppError,
-    features,
+    features, metrics,
     middleware::{cors, error_pages, request_context, request_id, security_headers},
     state::AppState,
 };
@@ -35,11 +39,12 @@ pub fn router(state: AppState) -> Router {
 /// Builds the complete Axum router with application state and shared middleware.
 ///
 /// Layers, outermost first: incoming request ID validation, request ID assignment,
-/// HTTP tracing, request ID
+/// request metrics, HTTP tracing, request ID
 /// propagation, request ID scoping for error bodies, security headers, CORS, panic
 /// catching, error-page normalization, then the request body limit.
 pub fn router_with(state: AppState, http: &HttpSettings) -> Router {
     let request_id_header = HeaderName::from_static("x-request-id");
+    let metrics = state.metrics.clone();
 
     let router = Router::new()
         .nest("/health", features::health::router())
@@ -65,6 +70,7 @@ pub fn router_with(state: AppState, http: &HttpSettings) -> Router {
                 )
                 .on_failure(DefaultOnFailure::new().latency_unit(LatencyUnit::Millis)),
         )
+        .layer(from_fn_with_state(metrics, metrics::record_request))
         .layer(SetRequestIdLayer::new(request_id_header, MakeRequestUuid))
         .layer(from_fn(request_id::sanitize))
 }

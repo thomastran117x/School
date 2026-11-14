@@ -24,6 +24,7 @@ use crate::{
         health::HealthService,
     },
     infrastructure::{DatabaseClient, RedisClient},
+    metrics::Metrics,
 };
 
 #[derive(Clone)]
@@ -48,6 +49,8 @@ pub struct AppState {
     /// Fail-open Redis cache for course catalogue reads.
     #[allow(dead_code)] // Consumed by the course catalogue service.
     pub(crate) course_cache: Arc<CourseCache>,
+    /// Prometheus recorder shared by the request middleware and the metrics listener.
+    pub(crate) metrics: Metrics,
 }
 
 /// Named inputs for [`AppState::from_parts`].
@@ -68,6 +71,8 @@ pub(crate) struct AppStateParts {
     pub(crate) refresh_sessions: Arc<dyn RefreshSessionStore>,
     /// Course catalogue cache.
     pub(crate) course_cache: Arc<CourseCache>,
+    /// Prometheus metrics recorder.
+    pub(crate) metrics: Metrics,
 }
 
 impl AppState {
@@ -81,6 +86,7 @@ impl AppState {
             health: parts.health,
             refresh_sessions: parts.refresh_sessions,
             course_cache: parts.course_cache,
+            metrics: parts.metrics,
         }
     }
 }
@@ -124,6 +130,7 @@ pub(crate) mod test_support {
             health::HealthService,
         },
         infrastructure::{DatabaseClient, RedisClient},
+        metrics::Metrics,
     };
 
     /// Builds state backed by lazy clients that never connect, using `health` as the
@@ -178,6 +185,7 @@ pub(crate) mod test_support {
             health,
             refresh_sessions,
             course_cache,
+            metrics: Metrics::new().expect("fixed metric buckets are valid"),
         })
     }
 }

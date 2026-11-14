@@ -3,18 +3,26 @@
 //! All probes run concurrently and are bounded independently so one slow datastore
 //! cannot delay the response beyond the configured timeout.
 
-use std::{fmt::Display, future::Future, time::Duration};
+use std::{
+    fmt::Display,
+    future::Future,
+    time::{Duration, Instant},
+};
 
 use async_trait::async_trait;
 
 use super::models::{DependencyStatuses, ReadinessReport};
-use crate::infrastructure::{DatabaseClient, DatabaseError, Datastores};
+use crate::{
+    infrastructure::{DatabaseClient, DatabaseError, Datastores},
+    metrics::Metrics,
+};
 
 #[derive(Clone)]
 /// Health service that probes MySQL, Redis, and OpenSearch.
 pub(crate) struct DatastoreHealthService {
     datastores: Datastores,
     timeout: Duration,
+    metrics: Option<Metrics>,
 }
 
 impl DatastoreHealthService {
@@ -23,7 +31,14 @@ impl DatastoreHealthService {
         Self {
             datastores,
             timeout,
+            metrics: None,
         }
+    }
+
+    /// Records probe duration and failures into `metrics`.
+    pub fn with_metrics(mut self, metrics: Metrics) -> Self {
+        self.metrics = Some(metrics);
+        self
     }
 
     /// Pings the lazy SeaORM MySQL pool.
@@ -32,12 +47,18 @@ impl DatastoreHealthService {
             let result: Result<(), DatabaseError> = database.ping().await;
             result
         };
-        bounded("mysql", self.timeout, ping).await
+        bounded("mysql", self.timeout, self.metrics.as_ref(), ping).await
     }
 
     /// Sends a Redis `PING` through the reconnecting connection manager.
     async fn redis(&self) -> bool {
-        bounded("redis", self.timeout, self.datastores.redis.ping()).await
+        bounded(
+            "redis",
+            self.timeout,
+            self.metrics.as_ref(),
+            self.datastores.redis.ping(),
+        )
+        .await
     }
 
     /// Sends an OpenSearch ping request and accepts only successful HTTP responses.
@@ -56,7 +77,7 @@ impl DatastoreHealthService {
                 Err(format!("unexpected HTTP status {}", response.status_code()))
             }
         };
-        bounded("opensearch", self.timeout, ping).await
+        bounded("opensearch", self.timeout, self.metrics.as_ref(), ping).await
     }
 }
 
@@ -82,8 +103,27 @@ pub(crate) trait HealthService: Send + Sync {
     async fn check(&self, database: &DatabaseClient) -> ReadinessReport;
 }
 
-/// Runs one dependency check under a timeout and logs operational failure details.
+/// Runs one dependency check under a timeout, logs operational failure details and
+/// records the probe's duration and outcome when `metrics` is provided.
 async fn bounded<T, E>(
+    service: &'static str,
+    timeout: Duration,
+    metrics: Option<&Metrics>,
+    check: impl Future<Output = Result<T, E>>,
+) -> bool
+where
+    E: Display,
+{
+    let started = Instant::now();
+    let healthy = probe(service, timeout, check).await;
+    if let Some(metrics) = metrics {
+        metrics.record_probe(service, started.elapsed().as_secs_f64(), healthy);
+    }
+    healthy
+}
+
+/// Runs the check under the timeout and logs failures.
+async fn probe<T, E>(
     service: &'static str,
     timeout: Duration,
     check: impl Future<Output = Result<T, E>>,
@@ -119,19 +159,19 @@ mod tests {
             Ok::<_, &'static str>(())
         };
 
-        assert!(!bounded("test", Duration::from_millis(1), check).await);
+        assert!(!bounded("test", Duration::from_millis(1), None, check).await);
     }
 
     #[tokio::test]
     async fn bounded_check_accepts_success_and_rejects_errors() {
         assert!(
-            bounded("test", Duration::from_secs(1), async {
+            bounded("test", Duration::from_secs(1), None, async {
                 Ok::<_, &'static str>(())
             })
             .await
         );
         assert!(
-            !bounded("test", Duration::from_secs(1), async {
+            !bounded("test", Duration::from_secs(1), None, async {
                 Err::<(), _>("failed")
             })
             .await
