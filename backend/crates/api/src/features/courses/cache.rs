@@ -40,7 +40,7 @@ use thiserror::Error;
 
 use crate::{
     config::CourseCacheSettings,
-    infrastructure::{Key, KeyNamespace, RedisClient, RedisError},
+    infrastructure::{Cache, Key, KeyNamespace, RedisClient, RedisError},
 };
 
 /// Counter keys outlive any in-flight read (database queries are bounded by seconds),
@@ -60,24 +60,6 @@ redis.call('SET', KEYS[2], ARGV[2], 'EX', ARGV[3])
 return 1
 ";
 
-/// Bumps the course counter (`KEYS[1]`) and catalogue generation (`KEYS[3]`), deletes the
-/// detail entry (`KEYS[2]`), and refreshes counter expiry (`ARGV[1]` seconds).
-const INVALIDATE_COURSE: &str = r"
-redis.call('INCR', KEYS[1])
-redis.call('EXPIRE', KEYS[1], ARGV[1])
-redis.call('DEL', KEYS[2])
-redis.call('INCR', KEYS[3])
-redis.call('EXPIRE', KEYS[3], ARGV[1])
-return 1
-";
-
-/// Bumps the catalogue generation (`KEYS[1]`), orphaning every cached listing page.
-const INVALIDATE_CATALOGUE: &str = r"
-redis.call('INCR', KEYS[1])
-redis.call('EXPIRE', KEYS[1], ARGV[1])
-return 1
-";
-
 #[derive(Debug, Error, PartialEq, Eq)]
 /// Failures raised while invalidating cached course data.
 pub(crate) enum CourseCacheError {
@@ -92,14 +74,17 @@ pub(crate) enum CourseCacheError {
 #[derive(Clone)]
 /// Fail-open, versioned Redis cache for course catalogue reads.
 pub(crate) struct CourseCache {
-    redis: RedisClient,
+    cache: Cache,
     settings: CourseCacheSettings,
 }
 
 impl CourseCache {
     /// Creates a cache over the shared Redis client with validated TTL settings.
     pub(crate) fn new(redis: RedisClient, settings: CourseCacheSettings) -> Self {
-        Self { redis, settings }
+        Self {
+            cache: Cache::new(redis),
+            settings,
+        }
     }
 
     /// Reads one course through the cache.
@@ -189,12 +174,18 @@ impl CourseCache {
         ) else {
             return Err(CourseCacheError::InvalidIdentifier);
         };
-        let keys = vec![
-            token.as_str().to_owned(),
-            entry.as_str().to_owned(),
-            generation.as_str().to_owned(),
-        ];
-        self.invalidate(INVALIDATE_COURSE, keys).await
+        // No conditional logic is needed, so a plain MULTI/EXEC group is atomic enough.
+        let seconds = COUNTER_TTL.as_secs();
+        self.invalidate(|| {
+            self.cache.atomic(|pipe| {
+                pipe.cmd("INCR").arg(token.as_str());
+                pipe.cmd("EXPIRE").arg(token.as_str()).arg(seconds);
+                pipe.cmd("DEL").arg(entry.as_str());
+                pipe.cmd("INCR").arg(generation.as_str());
+                pipe.cmd("EXPIRE").arg(generation.as_str()).arg(seconds);
+            })
+        })
+        .await
     }
 
     /// Invalidates every cached catalogue listing, for example after a bulk change.
@@ -205,19 +196,19 @@ impl CourseCache {
     pub(crate) async fn invalidate_catalogue(&self) -> Result<(), CourseCacheError> {
         let generation =
             course_key("gen.v1".to_owned()).ok_or(CourseCacheError::InvalidIdentifier)?;
-        self.invalidate(INVALIDATE_CATALOGUE, vec![generation.as_str().to_owned()])
+        self.invalidate(|| async { self.cache.incr(&generation, COUNTER_TTL).await.map(|_| ()) })
             .await
     }
 
-    async fn invalidate(
-        &self,
-        script: &'static str,
-        keys: Vec<String>,
-    ) -> Result<(), CourseCacheError> {
-        let args = vec![COUNTER_TTL.as_secs().to_string()];
+    /// Runs an invalidation, retrying once before reporting failure.
+    async fn invalidate<F, Fut>(&self, attempt_once: F) -> Result<(), CourseCacheError>
+    where
+        F: Fn() -> Fut,
+        Fut: Future<Output = Result<(), RedisError>>,
+    {
         for attempt in 1..=2 {
-            match self.invoke::<i64>(script, keys.clone(), args.clone()).await {
-                Ok(_) => return Ok(()),
+            match attempt_once().await {
+                Ok(()) => return Ok(()),
                 Err(error) => {
                     tracing::warn!(%error, attempt, "course cache invalidation attempt failed");
                 }
@@ -262,7 +253,7 @@ impl CourseCache {
 
     /// Reads a counter, treating a missing key as `0`; `None` when Redis fails.
     async fn read_counter(&self, key: &Key) -> Option<String> {
-        match self.redis.get(key).await {
+        match self.cache.get(key).await {
             Ok(value) => Some(value.unwrap_or_else(|| ABSENT_COUNTER.to_owned())),
             Err(error) => {
                 tracing::warn!(%error, "course cache unavailable; reading from the database");
@@ -273,18 +264,8 @@ impl CourseCache {
 
     /// Returns a decoded cache hit, or `None` for a miss, Redis error, or bad payload.
     async fn lookup<V: DeserializeOwned>(&self, key: &Key) -> Option<V> {
-        match self.redis.get(key).await {
-            Ok(Some(raw)) => match serde_json::from_str(&raw) {
-                Ok(value) => Some(value),
-                Err(_) => {
-                    tracing::warn!("discarding undecodable course cache entry");
-                    if let Err(error) = self.redis.delete(key).await {
-                        tracing::warn!(%error, "could not delete undecodable course cache entry");
-                    }
-                    None
-                }
-            },
-            Ok(None) => None,
+        match self.cache.get_json(key).await {
+            Ok(hit) => hit,
             Err(error) => {
                 tracing::warn!(%error, "course cache lookup failed; reading from the database");
                 None
@@ -306,10 +287,11 @@ impl CourseCache {
             return;
         };
         let result = self
-            .invoke::<i64>(
+            .cache
+            .eval::<i64>(
                 FILL_IF_UNCHANGED,
-                vec![token_key.as_str().to_owned(), entry_key.as_str().to_owned()],
-                vec![token.to_owned(), payload, ttl.as_secs().max(1).to_string()],
+                &[token_key, entry_key],
+                &[token.to_owned(), payload, ttl.as_secs().max(1).to_string()],
             )
             .await;
         match result {
@@ -317,32 +299,6 @@ impl CourseCache {
             Ok(_) => tracing::debug!("skipped stale course cache fill after invalidation"),
             Err(error) => tracing::warn!(%error, "course cache fill failed"),
         }
-    }
-
-    async fn invoke<T>(
-        &self,
-        script: &'static str,
-        keys: Vec<String>,
-        args: Vec<String>,
-    ) -> Result<T, RedisError>
-    where
-        T: redis::FromRedisValue + Send + 'static,
-    {
-        self.redis
-            .run(move |mut connection| {
-                Box::pin(async move {
-                    let script = redis::Script::new(script);
-                    let mut invocation = script.prepare_invoke();
-                    for key in &keys {
-                        invocation.key(key);
-                    }
-                    for arg in &args {
-                        invocation.arg(arg);
-                    }
-                    invocation.invoke_async::<T>(&mut connection).await
-                })
-            })
-            .await
     }
 }
 
@@ -585,8 +541,8 @@ mod tests {
             let id = unique_id();
             let key = course_key(format!("detail.v1.{id}")).unwrap();
             cache
-                .redis
-                .set_with_ttl(&key, "{not json", Duration::from_secs(30))
+                .cache
+                .set(&key, "{not json", Duration::from_secs(30))
                 .await
                 .unwrap();
 

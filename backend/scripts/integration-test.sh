@@ -108,6 +108,11 @@ cargo test --locked -p backend-api --bin backend-api \
     infrastructure::redis::tests::redis_round_trips_values_with_ttl \
     -- --ignored --exact
 
+echo "Checking the general cache (NX, counters, JSON, atomic groups, scripts)."
+cargo test --locked -p backend-api --bin backend-api \
+    infrastructure::cache::tests::integration:: \
+    -- --ignored
+
 echo "Checking refresh-session rotation, replay, revocation, concurrency, and expiry."
 cargo test --locked -p backend-api --bin backend-api \
     features::auth::refresh_store::service::tests::integration:: \

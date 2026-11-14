@@ -13,7 +13,7 @@ use super::{
 };
 use crate::{
     config::AuthSettings,
-    infrastructure::{Key, KeyNamespace, RedisClient, RedisError},
+    infrastructure::{Cache, Key, KeyNamespace, RedisClient, RedisError},
 };
 
 /// Number of random bytes in a refresh token (256 bits).
@@ -65,40 +65,31 @@ pub trait RefreshSessionStore: Send + Sync {
 #[derive(Clone)]
 /// [`RefreshSessionStore`] backed by the shared Redis client.
 pub struct RedisRefreshSessionStore {
-    redis: RedisClient,
+    cache: Cache,
     settings: AuthSettings,
 }
 
 impl RedisRefreshSessionStore {
     /// Creates a store that uses `redis` and the configured lifetimes.
     pub fn new(redis: RedisClient, settings: AuthSettings) -> Self {
-        Self { redis, settings }
+        Self {
+            cache: Cache::new(redis),
+            settings,
+        }
     }
 
     /// Runs a script and maps any Redis failure to a closed-fail error.
     async fn invoke<T>(
         &self,
         script: &'static str,
-        keys: Vec<String>,
-        args: Vec<String>,
+        keys: &[&Key],
+        args: &[String],
     ) -> Result<T, RefreshStoreError>
     where
         T: redis::FromRedisValue + Send + 'static,
     {
-        self.redis
-            .run(move |mut connection| {
-                Box::pin(async move {
-                    let script = redis::Script::new(script);
-                    let mut invocation = script.prepare_invoke();
-                    for key in &keys {
-                        invocation.key(key);
-                    }
-                    for arg in &args {
-                        invocation.arg(arg);
-                    }
-                    invocation.invoke_async::<T>(&mut connection).await
-                })
-            })
+        self.cache
+            .eval(script, keys, args)
             .await
             .map_err(unavailable)
     }
@@ -121,12 +112,8 @@ impl RefreshSessionStore for RedisRefreshSessionStore {
 
         self.invoke::<i64>(
             scripts::CREATE,
-            vec![
-                token_key.as_str().to_owned(),
-                family_key.as_str().to_owned(),
-                user_key.as_str().to_owned(),
-            ],
-            vec![
+            &[&token_key, &family_key, &user_key],
+            &[
                 user_id.to_owned(),
                 family_id.clone(),
                 millis(token_ttl),
@@ -154,8 +141,8 @@ impl RefreshSessionStore for RedisRefreshSessionStore {
         let reply: Vec<String> = self
             .invoke(
                 scripts::ROTATE,
-                vec![old_key.as_str().to_owned(), new_key.as_str().to_owned()],
-                vec![family_prefix(), millis(self.settings.refresh_token_ttl)],
+                &[&old_key, &new_key],
+                &[family_prefix(), millis(self.settings.refresh_token_ttl)],
             )
             .await?;
 
@@ -190,25 +177,17 @@ impl RefreshSessionStore for RedisRefreshSessionStore {
             return Ok(());
         }
         let key = token_key(presented_token)?;
-        self.invoke::<i64>(
-            scripts::REVOKE_SESSION,
-            vec![key.as_str().to_owned()],
-            vec![family_prefix()],
-        )
-        .await
-        .map(|_| ())
+        self.invoke::<i64>(scripts::REVOKE_SESSION, &[&key], &[family_prefix()])
+            .await
+            .map(|_| ())
     }
 
     async fn revoke_all(&self, user_id: &str) -> Result<(), RefreshStoreError> {
         let user_key = Key::new(KeyNamespace::UserSessions, user_id)
             .map_err(|_| RefreshStoreError::InvalidIdentifier)?;
-        self.invoke::<i64>(
-            scripts::REVOKE_USER,
-            vec![user_key.as_str().to_owned()],
-            vec![family_prefix()],
-        )
-        .await
-        .map(|_| ())
+        self.invoke::<i64>(scripts::REVOKE_USER, &[&user_key], &[family_prefix()])
+            .await
+            .map(|_| ())
     }
 }
 
