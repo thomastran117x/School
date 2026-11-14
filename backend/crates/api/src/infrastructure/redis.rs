@@ -161,12 +161,9 @@ impl RedisClient {
         value: &str,
         ttl: Duration,
     ) -> Result<(), RedisError> {
-        if ttl < Duration::from_secs(1) || ttl > MAX_TTL {
-            return Err(RedisError::InvalidTtl);
-        }
+        let seconds = validate_ttl(ttl)?;
         let key = key.as_str().to_owned();
         let value = value.to_owned();
-        let seconds = ttl.as_secs();
         self.run(|mut connection| {
             Box::pin(async move {
                 redis::cmd("SET")
@@ -199,6 +196,18 @@ impl RedisClient {
         })
         .await
     }
+}
+
+/// Validates a TTL (1 second to [`MAX_TTL`]) and returns it in whole seconds.
+///
+/// # Errors
+///
+/// Returns [`RedisError::InvalidTtl`] when `ttl` is outside the permitted range.
+pub(super) fn validate_ttl(ttl: Duration) -> Result<u64, RedisError> {
+    if ttl < Duration::from_secs(1) || ttl > MAX_TTL {
+        return Err(RedisError::InvalidTtl);
+    }
+    Ok(ttl.as_secs())
 }
 
 #[derive(Debug, Error)]

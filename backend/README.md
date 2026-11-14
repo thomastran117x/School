@@ -111,7 +111,7 @@ The API creates one lazy, auto-reconnecting Redis connection manager at startup 
 
 ### Redis keys and TTLs
 
-All keys are built with `Key::new(KeyNamespace, id)` as `app:v1:<namespace>:<id>`; identifiers are opaque (ASCII alphanumerics, `-`, `_`, `.`, up to 128 bytes) and must never contain secrets or token contents. Bump `v1` to invalidate all stored data after an incompatible format change. Writes use `RedisClient::set_with_ttl`; a TTL is mandatory, at least one second, and at most 30 days.
+All keys are built with `Key::new(KeyNamespace, id)` as `app:v1:<namespace>:<id>`; identifiers are opaque (ASCII alphanumerics, `-`, `_`, `.`, up to 128 bytes) and must never contain secrets or token contents. Bump `v1` to invalidate all stored data after an incompatible format change. Features use the general-purpose `Cache` (`infrastructure/cache.rs`) rather than hand-written Lua for common needs: raw and JSON get/set, `set_nx`, `get_del`, `delete_many`, `exists`, `ttl`, `expire`, `incr` (atomic INCR + EXPIRE), fail-open `get_or_load`, and `atomic` (a `MULTI`/`EXEC` group). A TTL is mandatory on every write, at least one second, and at most 30 days. Lua is reserved for logic that is both atomic and conditional (refresh-token rotation and revocation, the course guarded fill) and always runs through the single shared `Cache::eval` invoker.
 
 | Namespace | Prefix | Default TTL | Purpose |
 | --- | --- | --- | --- |
@@ -141,7 +141,7 @@ All keys are built with `Key::new(KeyNamespace, id)` as `app:v1:<namespace>:<id>
 
 **Invalidation.** After the database change commits, writers call `CourseCache::invalidate_course(id)` for any create, update, deactivation, or reactivation. It atomically deletes the detail entry and bumps the course counter and the catalogue generation, which orphans every cached listing page without scanning (orphans expire by TTL). `invalidate_catalogue()` is available for bulk changes. Invalidation is retried once; if Redis is still down, the error is returned and logged, and staleness is bounded by the TTLs above.
 
-**Stale-fill protection.** Readers record the counter before querying MySQL and fill the cache with a Lua script that writes only if the counter is unchanged. A read that overlaps a deactivation therefore cannot re-cache the pre-deactivation row. The scripts assume a single Redis node; a clustered deployment would need hash tags.
+**Stale-fill protection.** Readers record the counter before querying MySQL and fill the cache with a Lua script that writes only if the counter is unchanged. A read that overlaps a deactivation therefore cannot re-cache the pre-deactivation row. Invalidation itself is an unconditional `MULTI`/`EXEC` group built with `Cache::atomic`. The scripts assume a single Redis node; a clustered deployment would need hash tags.
 
 ### Refresh sessions
 
