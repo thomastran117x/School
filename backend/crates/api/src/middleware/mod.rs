@@ -5,6 +5,7 @@
 
 pub mod cors;
 pub mod error_pages;
+pub mod rate_limit;
 pub mod request_context;
 pub mod request_id;
 pub mod security_headers;

@@ -32,7 +32,11 @@ pub fn layer(settings: &CorsSettings) -> CorsLayer {
         .allow_origin(AllowOrigin::list(origins))
         .allow_methods(methods)
         .allow_headers(headers)
-        .expose_headers([HeaderName::from_static("x-request-id")])
+        .expose_headers([
+            HeaderName::from_static("x-request-id"),
+            // Lets browser clients honour 429/503 retry guidance.
+            HeaderName::from_static("retry-after"),
+        ])
         .allow_credentials(settings.allow_credentials)
         .max_age(settings.max_age)
 }

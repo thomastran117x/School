@@ -23,7 +23,9 @@ use crate::{
     config::HttpSettings,
     error::AppError,
     features, metrics,
-    middleware::{cors, error_pages, request_context, request_id, security_headers},
+    middleware::{
+        cors, error_pages, rate_limit::limit_by_ip, request_context, request_id, security_headers,
+    },
     state::AppState,
 };
 
@@ -40,11 +42,15 @@ pub fn router(state: AppState) -> Router {
 ///
 /// Layers, outermost first: incoming request ID validation, request ID assignment,
 /// request metrics, HTTP tracing, request ID
-/// propagation, request ID scoping for error bodies, security headers, CORS, panic
-/// catching, error-page normalization, then the request body limit.
+/// propagation, request ID scoping for error bodies, security headers, CORS, the
+/// general per-IP rate limit, panic catching, error-page normalization, then the
+/// request body limit.
 pub fn router_with(state: AppState, http: &HttpSettings) -> Router {
     let request_id_header = HeaderName::from_static("x-request-id");
     let metrics = state.metrics.clone();
+    let general_limit = state
+        .rate_limiter
+        .ip_limit(state.rate_limiter.policies().general_ip);
 
     let router = Router::new()
         .nest("/health", features::health::router())
@@ -55,6 +61,8 @@ pub fn router_with(state: AppState, http: &HttpSettings) -> Router {
         .layer(CatchPanicLayer::custom(|_| {
             AppError::internal("request handler panicked").into_response()
         }))
+        // Inside CORS so throttled responses still carry CORS headers.
+        .layer(from_fn_with_state(general_limit, limit_by_ip))
         .layer(cors::layer(&http.cors));
 
     security_headers::apply(router, http)

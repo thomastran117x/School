@@ -54,6 +54,14 @@ async fn main() -> anyhow::Result<()> {
             .with_metrics(metrics.clone()),
     );
     let http_settings = settings.http.clone();
+    let rate_limiter = middleware::rate_limit::RateLimiter::new(
+        redis.clone(),
+        metrics.clone(),
+        &settings.rate_limit,
+    );
+    if !settings.rate_limit.enabled {
+        tracing::warn!("rate limiting is disabled; authentication routes are unthrottled");
+    }
     let state = AppState::from_parts(AppStateParts {
         config: Arc::new(settings.clone()),
         database,
@@ -63,6 +71,7 @@ async fn main() -> anyhow::Result<()> {
         refresh_sessions,
         course_cache,
         metrics: metrics.clone(),
+        rate_limiter,
     });
     let metrics_settings = settings.metrics.clone();
     let metrics_state = state.clone();
@@ -116,9 +125,13 @@ async fn main() -> anyhow::Result<()> {
         let _ = stop_tx.send(true);
     };
     let outcome = shutdown::serve_with_deadline(signal, shutdown_timeout, |trigger| async move {
-        axum::serve(listener, app)
-            .with_graceful_shutdown(trigger)
-            .await
+        // Connection info exposes the TCP peer to the rate limiter's client-IP logic.
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .with_graceful_shutdown(trigger)
+        .await
     })
     .await;
 
