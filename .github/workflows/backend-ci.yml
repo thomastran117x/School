@@ -6,6 +6,7 @@ on:
       - "backend/**"
       - ".github/workflows/backend-ci.yml"
   push:
+    branches: main
     paths:
       - "backend/**"
       - ".github/workflows/backend-ci.yml"
@@ -18,17 +19,20 @@ concurrency:
   group: backend-ci-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+defaults:
+  run:
+    shell: bash
+    working-directory: backend
+
+env:
+  RUST_TOOLCHAIN: 1.92.0
+  CARGO_TERM_COLOR: always
+
 jobs:
-  backend:
-    name: Quality, build, and tests
+  format:
+    name: Format
     runs-on: ubuntu-24.04
-    timeout-minutes: 45
-
-    defaults:
-      run:
-        shell: bash
-        working-directory: backend
-
+    timeout-minutes: 30
     steps:
       - name: Check out repository
         uses: actions/checkout@v7
@@ -37,17 +41,69 @@ jobs:
 
       - name: Install Rust toolchain
         run: |
-          rustup toolchain install 1.92.0 --profile minimal
-          rustup component add rustfmt clippy --toolchain 1.92.0
-          rustup default 1.92.0
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal
+          rustup component add rustfmt --toolchain "$RUST_TOOLCHAIN"
+          rustup default "$RUST_TOOLCHAIN"
           rustc --version
           cargo --version
+
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: backend
 
       - name: Check formatting
         run: cargo fmt --all -- --check
 
+
+  lint:
+    name: Clippy
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal
+          rustup component add clippy --toolchain "$RUST_TOOLCHAIN"
+          rustup default "$RUST_TOOLCHAIN"
+          rustc --version
+          cargo --version
+
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: backend
+
       - name: Run Clippy
         run: cargo clippy --locked --workspace --all-targets -- -D warnings
+
+
+  build:
+    name: Check and build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal
+          rustup default "$RUST_TOOLCHAIN"
+          rustc --version
+          cargo --version
+
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: backend
 
       - name: Check compilation
         run: cargo check --locked --workspace --all-targets
@@ -55,8 +111,85 @@ jobs:
       - name: Build workspace
         run: cargo build --locked --workspace --all-targets
 
+
+  test:
+    name: Unit tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal
+          rustup default "$RUST_TOOLCHAIN"
+          rustc --version
+          cargo --version
+
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: backend
+
       - name: Run unit tests
         run: cargo test --locked --workspace --lib --bins
+
+
+  docs:
+    name: Docs and Compose config
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal
+          rustup default "$RUST_TOOLCHAIN"
+          rustc --version
+          cargo --version
+
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: backend
+
+      - name: Build documentation
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo doc --locked --workspace --no-deps --document-private-items
+
+      - name: Validate Compose file
+        run: docker compose config --quiet
+
+
+  integration:
+    name: Integration tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal
+          rustup default "$RUST_TOOLCHAIN"
+          rustc --version
+          cargo --version
+
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: backend
 
       - name: Prepare OpenSearch host
         run: sudo sysctl -w vm.max_map_count=262144
@@ -64,9 +197,19 @@ jobs:
       - name: Run integration tests
         run: bash scripts/integration-test.sh
 
+
+  docker:
+    name: Deployment image
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
       - name: Build deployment image
         run: docker compose --profile full build api
 
       - name: Verify packaged migration CLI
         run: docker compose --profile full run --rm --no-deps --entrypoint migration api --version
-

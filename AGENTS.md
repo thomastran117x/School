@@ -1,6 +1,6 @@
 # Repository instructions
 
-These instructions apply to the entire repository. The project currently consists of a Rust backend under `backend/`.
+These instructions apply to the entire repository. The project consists of a Rust backend under `backend/` and a Next.js frontend under `frontend/` (see `frontend/README.md` for its checks; read `frontend/AGENTS.md` first).
 
 ## Start here
 
