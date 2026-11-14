@@ -46,9 +46,10 @@ pub enum AppError {
     /// The request body exceeded the configured limit.
     #[error("payload too large")]
     PayloadTooLarge,
-    /// An unexpected server-side failure. The source is logged but never returned.
-    #[error("internal server error")]
-    Internal(#[source] Box<dyn std::error::Error + Send + Sync>),
+    /// An unexpected server-side failure. Only a static diagnostic is carried, so no
+    /// runtime data (URLs, credentials, student data) can reach the logs or the client.
+    #[error("internal server error: {0}")]
+    Internal(&'static str),
 }
 
 #[derive(Serialize)]
@@ -70,10 +71,14 @@ struct ErrorBody<'a> {
 }
 
 impl AppError {
-    /// Wraps an unexpected failure as an internal error.
+    /// Creates an internal error from a static, secret-free diagnostic.
+    ///
+    /// The `&'static str` bound is deliberate: it rejects formatted strings and
+    /// `Display` output of third-party errors, which may embed secrets. Log the
+    /// detailed cause separately through a sanitized, typed error instead.
     #[allow(dead_code)]
-    pub fn internal(source: impl Into<Box<dyn std::error::Error + Send + Sync>>) -> Self {
-        Self::Internal(source.into())
+    pub fn internal(reason: &'static str) -> Self {
+        Self::Internal(reason)
     }
 
     /// Returns the HTTP status code for this error.
@@ -120,8 +125,8 @@ impl AppError {
 
 impl IntoResponse for AppError {
     fn into_response(self) -> Response {
-        if let Self::Internal(source) = &self {
-            tracing::error!(error = %source, "request failed with an internal error");
+        if let Self::Internal(reason) = &self {
+            tracing::error!(reason = *reason, "request failed with an internal error");
         }
         let request_id = request_context::current();
         let body = ErrorEnvelope {
@@ -194,12 +199,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn internal_errors_never_leak_their_source() {
-        let (status, body) =
-            render(AppError::internal("mysql://root:hunter2@db/secret failed")).await;
+    async fn internal_errors_never_leak_their_diagnostic_to_clients() {
+        let (status, body) = render(AppError::internal("cache write failed")).await;
 
         assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
-        assert!(!body.to_string().contains("hunter2"));
+        assert!(!body.to_string().contains("cache write failed"));
         assert_eq!(body["error"]["message"], "internal server error");
     }
 
