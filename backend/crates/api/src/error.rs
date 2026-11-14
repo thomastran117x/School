@@ -6,6 +6,9 @@
 //! {"error": {"code": "not_found", "message": "resource not found", "request_id": "…"}}
 //! ```
 //!
+//! Validation failures of a well-formed request return 422 with a `fields` array of
+//! per-field errors (`{"field", "code", "message"}`); malformed requests return 400.
+//!
 //! Internal failures are logged server-side and never serialized. Only messages that
 //! are safe to show to a client may be placed in [`AppError::Validation`] and
 //! [`AppError::Conflict`].
@@ -28,6 +31,9 @@ pub enum AppError {
     /// The request was malformed or failed validation. The message is client-safe.
     #[error("validation failed: {0}")]
     Validation(String),
+    /// The request was well-formed but one or more fields are invalid.
+    #[error("request validation failed")]
+    UnprocessableEntity(Vec<FieldError>),
     /// Authentication is missing or invalid.
     #[error("authentication required")]
     Unauthorized,
@@ -52,6 +58,17 @@ pub enum AppError {
     Internal(&'static str),
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+/// A single client-safe validation failure tied to one request field.
+pub struct FieldError {
+    /// Dotted path of the offending field, e.g. `items[0].name`.
+    pub field: String,
+    /// Stable machine-readable rule code, e.g. `length` or `required`.
+    pub code: String,
+    /// Human-readable, client-safe message.
+    pub message: String,
+}
+
 #[derive(Serialize)]
 /// Top-level JSON envelope of every error response.
 struct ErrorEnvelope<'a> {
@@ -68,6 +85,9 @@ struct ErrorBody<'a> {
     message: &'a str,
     /// Identifier of the failed request, for correlation with server logs.
     request_id: Option<&'a str>,
+    /// Per-field validation failures, present only for 422 responses.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    fields: Option<&'a [FieldError]>,
 }
 
 impl AppError {
@@ -85,6 +105,7 @@ impl AppError {
     pub fn status(&self) -> StatusCode {
         match self {
             Self::Validation(_) => StatusCode::BAD_REQUEST,
+            Self::UnprocessableEntity(_) => StatusCode::UNPROCESSABLE_ENTITY,
             Self::Unauthorized => StatusCode::UNAUTHORIZED,
             Self::Forbidden => StatusCode::FORBIDDEN,
             Self::NotFound => StatusCode::NOT_FOUND,
@@ -99,6 +120,7 @@ impl AppError {
     pub fn code(&self) -> &'static str {
         match self {
             Self::Validation(_) => "validation_error",
+            Self::UnprocessableEntity(_) => "validation_failed",
             Self::Unauthorized => "unauthorized",
             Self::Forbidden => "forbidden",
             Self::NotFound => "not_found",
@@ -113,6 +135,7 @@ impl AppError {
     fn public_message(&self) -> &str {
         match self {
             Self::Validation(message) | Self::Conflict(message) => message,
+            Self::UnprocessableEntity(_) => "request validation failed",
             Self::Unauthorized => "authentication required",
             Self::Forbidden => "forbidden",
             Self::NotFound => "resource not found",
@@ -134,6 +157,10 @@ impl IntoResponse for AppError {
                 code: self.code(),
                 message: self.public_message(),
                 request_id: request_id.as_deref(),
+                fields: match &self {
+                    Self::UnprocessableEntity(fields) => Some(fields),
+                    _ => None,
+                },
             },
         };
         (self.status(), Json(body)).into_response()
@@ -161,6 +188,11 @@ mod tests {
                 AppError::Validation("bad".into()),
                 StatusCode::BAD_REQUEST,
                 "validation_error",
+            ),
+            (
+                AppError::UnprocessableEntity(vec![]),
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "validation_failed",
             ),
             (
                 AppError::Unauthorized,
@@ -205,6 +237,21 @@ mod tests {
         assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
         assert!(!body.to_string().contains("cache write failed"));
         assert_eq!(body["error"]["message"], "internal server error");
+    }
+
+    #[tokio::test]
+    async fn unprocessable_entity_lists_field_errors() {
+        let error = AppError::UnprocessableEntity(vec![FieldError {
+            field: "name".into(),
+            code: "length".into(),
+            message: "too long".into(),
+        }]);
+        let (_, body) = render(error).await;
+
+        assert_eq!(
+            body["error"]["fields"],
+            json!([{"field": "name", "code": "length", "message": "too long"}])
+        );
     }
 
     #[tokio::test]

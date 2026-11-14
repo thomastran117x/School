@@ -8,6 +8,7 @@
 mod app;
 mod config;
 mod error;
+mod extract;
 mod features;
 mod infrastructure;
 mod middleware;
