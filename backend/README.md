@@ -234,6 +234,10 @@ All keys are built with `Key::new(KeyNamespace, id)` as `app:v1:<namespace>:<id>
 | `UserSessions` | `app:v1:user_sessions:` | `REFRESH_FAMILY_MAX_LIFETIME_SECONDS` | Set of a user's family ids, used by logout-all |
 | `Course` | `app:v1:course:` | `COURSE_CACHE_*_TTL_SECONDS` | Course catalogue read cache and its invalidation counters |
 
+### Redis operations
+
+Refresh sessions are auth-critical and share Redis with disposable caches. Full requirements are in [docs/redis-operations.md](docs/redis-operations.md): AOF persistence (`appendfsync everysec`) plus a replica in production, `maxmemory-policy noeviction` on any instance holding sessions (every key has a TTL, so `volatile-*` policies do not protect them), explicit `maxmemory` and alert thresholds, backup and restore rules, restart and session-loss behaviour, and the recommendation to isolate auth sessions from cache workloads on a separate instance. The Compose Redis service applies the development baseline, with the memory cap set by `REDIS_MAXMEMORY` (default `256mb`).
+
 ### Course catalogue cache
 
 `features/courses/cache.rs` provides cache-aside reads for the course catalogue. MySQL is the source of truth; Redis only speeds up display reads and is **never** consulted for authorization or application-acceptance decisions (for example "is this course active and open for applications?"), which must read MySQL directly.

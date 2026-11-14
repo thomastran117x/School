@@ -25,7 +25,18 @@ services:
 
   redis:
     image: redis:8.10.1-alpine
-    command: ["redis-server", "--appendonly", "yes"]
+    # Development baseline for auth-critical data: durable AOF, bounded memory, and no
+    # eviction so session keys are never dropped silently. See docs/redis-operations.md.
+    command:
+      - redis-server
+      - --appendonly
+      - "yes"
+      - --appendfsync
+      - everysec
+      - --maxmemory
+      - ${REDIS_MAXMEMORY:-256mb}
+      - --maxmemory-policy
+      - noeviction
     ports:
       - "${REDIS_PORT:-6379}:6379"
     volumes:
