@@ -257,6 +257,10 @@ Refresh sessions are auth-critical and share Redis with disposable caches. Full 
 
 **Stale-fill protection.** Readers record the counter before querying MySQL and fill the cache with a Lua script that writes only if the counter is unchanged. A read that overlaps a deactivation therefore cannot re-cache the pre-deactivation row. Invalidation itself is an unconditional `MULTI`/`EXEC` group built with `Cache::atomic`. The scripts assume a single Redis node; a clustered deployment would need hash tags.
 
+### Identity model
+
+`features/auth/identity` holds the SeaORM entities and value types for users, password credentials, and linked OAuth identities. Its rules are described in [Identity schema](#identity-schema).
+
 ### Refresh sessions
 
 The refresh-session store (`features/auth/refresh_store`) issues opaque 256-bit tokens and stores only their SHA-256 hash. Rotation, logout, and logout-all each run as one Lua script, so concurrent use of the same token yields at most one successor. Presenting an already-rotated token revokes its whole session family. The scripts derive family keys from stored ids, which assumes a single Redis node; a clustered deployment needs hash tags. Every Redis failure surfaces as `RefreshStoreError::Unavailable`, which callers must treat as a denial (fail closed).
@@ -265,9 +269,51 @@ The Compose OpenSearch service disables its security plugin for local developmen
 
 ## Migrations
 
-The migration crate owns the authoritative MySQL schema for users, external identities, courses, applications, and application reviews. Migrations never run implicitly during API startup; run them as an explicit release step before deploying application instances that depend on the new schema.
+The migration crate owns the authoritative MySQL schema for users, local credentials, external identities, courses, applications, and application reviews. Migrations never run implicitly during API startup; run them as an explicit release step before deploying application instances that depend on the new schema.
 
-All primary and foreign keys use application-generated UUIDv7 values stored as `BINARY(16)`. Application timestamps are UTC `DATETIME(6)` values. The database enforces account roles and states, application and review states, positive course capacity, unique emails and course codes, one application per student and course, one final review per application, and audit-preserving foreign keys.
+All primary and foreign keys use application-generated UUIDv7 values stored as `BINARY(16)`. Application timestamps are UTC `DATETIME(6)` values. The database enforces account roles and states, application and review states, positive course capacity, unique emails and course codes, one application per student and course, one final review per application, and audit-preserving foreign keys. The identity tables are described in [Identity schema](#identity-schema).
+
+> **Identity schema rewrite.** Migrations `000001_create_users` and `000002_create_external_identities` were rewritten in place, and `000006_create_local_credentials` was added. A local database that applied the earlier versions must be rebuilt with `cargo run -p migration -- fresh`. Do this only against a disposable development database, because it drops all data.
+
+### Identity schema
+
+| Table | Purpose | Key constraints |
+| --- | --- | --- |
+| `users` | One row per account, including anonymized tombstones | `uq_users_normalized_email` (byte-exact; NULLs allowed only for `DELETED`), role `STUDENT`/`ADMIN` (default `STUDENT`), lifecycle checks below |
+| `local_credentials` | Optional password credential; PK `user_id`, so at most one per user | Argon2id PHC strings only (`$argon2id$…`, `password_algorithm = 'ARGON2ID'`); FK `ON DELETE CASCADE` |
+| `external_identities` | Google / Microsoft OpenID Connect identities | `UNIQUE (provider, provider_subject)` so an identity links to at most one user; `UNIQUE (user_id, provider)` so a user has at most one per provider; `provider IN ('GOOGLE','MICROSOFT')`; `tenant_id` only for `MICROSOFT`; FK `ON DELETE CASCADE` |
+
+A user with no `local_credentials` row is OAuth-only. `users` holds no secret material. Rust entities and value types live in `crates/api/src/features/auth/identity/`:
+
+- `PasswordHash` accepts only Argon2id PHC strings. Its `Debug` output prints `[REDACTED]`, and it implements neither `Display` nor `Serialize`.
+- No identity entity derives `Serialize`, so password hashes cannot reach responses or logs by accident.
+- `NewStudentAccount` has no role field. It always inserts `STUDENT` / `UNVERIFIED`.
+- `NewExternalIdentity` rejects a tenant for any provider other than Microsoft.
+
+**Account lifecycle.** `UNVERIFIED → ACTIVE ⇄ DISABLED`, and any live state may move to `PENDING_DELETION → DELETED`. The database enforces:
+
+- `ACTIVE` requires `email_verified_at`, and `UNVERIFIED` forbids it.
+- `deletion_requested_at` is set exactly for `PENDING_DELETION` and `DELETED`.
+- `deleted_at` is set exactly for `DELETED`.
+- `email` and `normalized_email` are both set or both `NULL`, and may be `NULL` only for `DELETED`.
+- `idx_users_deletion_queue (account_status, deletion_requested_at)` serves the cleanup job.
+
+**Deletion and retention (AUTH-12).**
+
+- `applications` and `application_reviews` reference `users` with `RESTRICT`, so a user with history is never hard-deleted.
+- Deletion runs in one transaction. It sets `DELETED` and `deleted_at`, clears both email columns (which frees the address for a new signup), replaces `display_name`, and deletes the user's `local_credentials` and `external_identities` rows.
+- Applications and reviews are retained and still point to the tombstone.
+- An account with no history, such as a never-verified signup, may be hard-deleted. The `CASCADE` foreign keys then remove its credential and identity rows. These cascades are limited to auth-only tables that have no dependents.
+
+**Roles.** No API path creates or elevates `ADMIN`. Administrators are provisioned out-of-band. Signup must build its insert from `NewStudentAccount` and reject unknown request fields.
+
+**Federated login and linking.**
+
+- A login is matched only by `(provider, provider_subject)`, where the subject is the ID token's immutable `sub` claim. For Microsoft, also record `tid` in `tenant_id`. Never use email, UPN, or other mutable claims as the identifier.
+- An unknown identity is never merged into an existing account by email. If its email matches an existing user, the login is refused, and the user is told to sign in with their existing method and link the provider explicitly.
+- Linking is allowed only from an authenticated session after recent reauthentication.
+- A user cannot unlink their last remaining sign-in method.
+- `users.id` and `provider_subject` are immutable. `ON UPDATE RESTRICT` protects referenced IDs, and the Rust layer exposes no update path. Triggers are not used, because creating them on servers with binary logging requires elevated privileges.
 
 For local development, apply and inspect migrations with:
 
