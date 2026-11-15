@@ -20,7 +20,8 @@ use opensearch::OpenSearch;
 use crate::{
     config::Settings,
     features::{
-        auth::refresh_store::RefreshSessionStore, courses::cache::CourseCache,
+        auth::{access_token::AccessTokenService, refresh_store::RefreshSessionStore},
+        courses::cache::CourseCache,
         health::HealthService,
     },
     infrastructure::{DatabaseClient, RedisClient},
@@ -47,6 +48,8 @@ pub struct AppState {
     /// Refresh-session store consumed by the authentication endpoints.
     #[allow(dead_code)] // Consumed by AUTH-07.
     pub(crate) refresh_sessions: Arc<dyn RefreshSessionStore>,
+    /// Stateless access-token signer and verifier; needs no datastore.
+    pub(crate) access_tokens: Arc<AccessTokenService>,
     /// Fail-open Redis cache for course catalogue reads.
     #[allow(dead_code)] // Consumed by the course catalogue service.
     pub(crate) course_cache: Arc<CourseCache>,
@@ -72,6 +75,8 @@ pub(crate) struct AppStateParts {
     pub(crate) health: Arc<dyn HealthService>,
     /// Refresh-session store implementation.
     pub(crate) refresh_sessions: Arc<dyn RefreshSessionStore>,
+    /// Access-token service.
+    pub(crate) access_tokens: Arc<AccessTokenService>,
     /// Course catalogue cache.
     pub(crate) course_cache: Arc<CourseCache>,
     /// Prometheus metrics recorder.
@@ -90,6 +95,7 @@ impl AppState {
             opensearch: parts.opensearch,
             health: parts.health,
             refresh_sessions: parts.refresh_sessions,
+            access_tokens: parts.access_tokens,
             course_cache: parts.course_cache,
             metrics: parts.metrics,
             rate_limiter: parts.rate_limiter,
@@ -115,6 +121,12 @@ impl FromRef<AppState> for Arc<Settings> {
     }
 }
 
+impl FromRef<AppState> for Arc<AccessTokenService> {
+    fn from_ref(state: &AppState) -> Self {
+        Arc::clone(&state.access_tokens)
+    }
+}
+
 /// Test helpers for building [`AppState`] without live datastores.
 #[cfg(test)]
 pub(crate) mod test_support {
@@ -132,7 +144,8 @@ pub(crate) mod test_support {
             RateLimitSettings, RedisSettings, RedisTlsMode, Settings,
         },
         features::{
-            auth::refresh_store::RedisRefreshSessionStore, courses::cache::CourseCache,
+            auth::{access_token::AccessTokenService, refresh_store::RedisRefreshSessionStore},
+            courses::cache::CourseCache,
             health::HealthService,
         },
         infrastructure::{DatabaseClient, RedisClient},
@@ -185,6 +198,7 @@ pub(crate) mod test_support {
             CourseCacheSettings::default(),
         ));
         let settings = Settings::for_tests();
+        let access_tokens = Arc::new(AccessTokenService::new(&settings.jwt));
         let metrics = Metrics::new().expect("fixed metric buckets are valid");
         // Effectively unlimited so unrelated router tests are never throttled.
         let rate_limiter = RateLimiter::new(
@@ -202,6 +216,7 @@ pub(crate) mod test_support {
             opensearch,
             health,
             refresh_sessions,
+            access_tokens,
             course_cache,
             metrics,
             rate_limiter,

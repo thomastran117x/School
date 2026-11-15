@@ -25,6 +25,11 @@ export APP_HOST="127.0.0.1"
 METRICS_PORT="${METRICS_PORT:-19090}"
 export METRICS_ADDR="127.0.0.1:${METRICS_PORT}"
 export METRICS_BEARER_TOKEN="integration-test-token"
+# APP_ENV defaults to production, which refuses the published dev JWT key, so each run
+# signs with a fresh ephemeral Ed25519 key.
+export JWT_SIGNING_KEY_ID="integration-test"
+JWT_SIGNING_KEY="$(openssl genpkey -algorithm ed25519 -outform DER | base64 | tr -d '\n\r')"
+export JWT_SIGNING_KEY
 export RUST_LOG="backend_api=info"
 
 TEST_TMP_DIR="$(mktemp -d)"

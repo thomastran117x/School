@@ -200,11 +200,18 @@ impl IntoResponse for AppError {
             },
         };
         let retry_after = self.retry_after_seconds();
+        let challenge = matches!(self, Self::Unauthorized);
         let mut response = (self.status(), Json(body)).into_response();
         if let Some(seconds) = retry_after {
             response
                 .headers_mut()
                 .insert(header::RETRY_AFTER, HeaderValue::from(seconds));
+        }
+        if challenge {
+            // RFC 6750 challenge without error details, so failures are indistinguishable.
+            response
+                .headers_mut()
+                .insert(header::WWW_AUTHENTICATE, HeaderValue::from_static("Bearer"));
         }
         response
     }
@@ -316,6 +323,20 @@ mod tests {
             Some("5")
         );
         assert_eq!(header(AppError::NotFound), None);
+    }
+
+    #[test]
+    fn only_unauthorized_carries_a_bearer_challenge() {
+        let challenge = |error: AppError| {
+            error
+                .into_response()
+                .headers()
+                .get(header::WWW_AUTHENTICATE)
+                .map(|value| value.to_str().unwrap().to_owned())
+        };
+        assert_eq!(challenge(AppError::Unauthorized).as_deref(), Some("Bearer"));
+        assert_eq!(challenge(AppError::Forbidden), None);
+        assert_eq!(challenge(AppError::NotFound), None);
     }
 
     #[tokio::test]
