@@ -5,7 +5,7 @@
 
 /// Authentication building blocks: the refresh-session store and the identity model.
 pub(crate) mod auth;
-/// Course catalogue read caching, starting with cache-aside helpers.
+/// Learning courses: the MySQL course model and catalogue read caching.
 pub(crate) mod courses;
 /// Liveness and datastore-readiness endpoints.
 pub(crate) mod health;
