@@ -99,6 +99,13 @@ Configuration comes from environment variables. For local Cargo runs, `dotenvy` 
 | `SHUTDOWN_TIMEOUT_MS` | No | `10000` | Maximum time in-flight requests may drain after SIGTERM/SIGINT before connections are dropped; see [Graceful shutdown](#graceful-shutdown) |
 | `REFRESH_TOKEN_TTL_SECONDS` | No | `604800` | Lifetime of each refresh token (1 second to 30 days) |
 | `REFRESH_FAMILY_MAX_LIFETIME_SECONDS` | No | `2592000` | Absolute lifetime of a refresh-session family; at least the token TTL, at most 30 days |
+| `JWT_SIGNING_KEY_ID` | Yes | — | `kid` of the active signing key: 1-64 characters of `A-Z a-z 0-9 . _ -` |
+| `JWT_SIGNING_KEY` | Yes | — | Base64 Ed25519 PKCS#8 DER private key; never logged. The published dev key is refused unless `APP_ENV=development`; see [Access tokens](#access-tokens) |
+| `JWT_VERIFICATION_KEYS` | No | empty | Extra public keys accepted during rotation: comma-separated `kid:base64-SPKI-DER`, at most 4, unique kids |
+| `JWT_ISSUER` | No | `school-api` | `iss` claim issued and required; no whitespace, at most 256 characters |
+| `JWT_AUDIENCE` | No | `school-api` | `aud` claim issued and required; same rules as the issuer |
+| `JWT_ACCESS_TOKEN_TTL_SECONDS` | No | `900` | Access-token lifetime, 60 to 3600 seconds |
+| `JWT_CLOCK_SKEW_SECONDS` | No | `30` | Clock-skew allowance for `exp` and `iat` checks, 0 to 120 seconds |
 | `COURSE_CACHE_DETAIL_TTL_SECONDS` | No | `300` | Lifetime of a cached course read (1 second to 30 days); also the staleness bound if an invalidation is missed |
 | `COURSE_CACHE_LIST_TTL_SECONDS` | No | `60` | Lifetime of a cached catalogue page; must not exceed the detail TTL |
 | `COURSE_CACHE_NEGATIVE_TTL_SECONDS` | No | `30` | Lifetime of a cached "course not found"; must not exceed the detail TTL |
@@ -264,6 +271,58 @@ Refresh sessions are auth-critical and share Redis with disposable caches. Full 
 ### Refresh sessions
 
 The refresh-session store (`features/auth/refresh_store`) issues opaque 256-bit tokens and stores only their SHA-256 hash. Rotation, logout, and logout-all each run as one Lua script, so concurrent use of the same token yields at most one successor. Presenting an already-rotated token revokes its whole session family. The scripts derive family keys from stored ids, which assumes a single Redis node; a clustered deployment needs hash tags. Every Redis failure surfaces as `RefreshStoreError::Unavailable`, which callers must treat as a denial (fail closed).
+
+### Access tokens
+
+`features/auth/access_token` issues and verifies short-lived, stateless JWT access tokens. Verification uses only the configured public keys. `AccessTokenService` holds no datastore client, so a valid token is accepted without any Redis or MySQL lookup and keeps working during a datastore outage.
+
+**Contract.** Tokens are compact JWS signed with **EdDSA (Ed25519)**, the only accepted algorithm.
+
+- Header: `{"alg": "EdDSA", "typ": "at+jwt", "kid": "<JWT_SIGNING_KEY_ID>"}`.
+- Claims:
+  - `iss` (`JWT_ISSUER`) and `aud` (`JWT_AUDIENCE`, a single string);
+  - `sub`, the user's UUID;
+  - `iat` and `exp`, in Unix seconds;
+  - `jti`, a random UUID;
+  - `role`, `STUDENT` or `ADMIN`.
+
+`issue(user_id, role)` must be given values read from the database, never from the request.
+
+**Using it in handlers.** Add `principal: AuthenticatedPrincipal` as a handler argument. It reads exactly one `Authorization: Bearer <token>` header (the scheme is case-insensitive) and never reads the body, query or cookies, so a client cannot supply its own user ID or role. The principal has no public constructor. Router tests can use `AuthenticatedPrincipal::for_tests`. Every failure returns the same `401` `unauthorized` body with `WWW-Authenticate: Bearer`, so clients cannot tell which check failed. The server logs only a static reason at debug level (`access token rejected`, `reason=expired`), never the token or its claims.
+
+**Rejected tokens.** A token is rejected when it has:
+
+- any `alg` other than `EdDSA`, including `none`, HS256 signed with a public key, and RS256;
+- a `typ` other than `at+jwt`;
+- a missing or unknown `kid`, or any `crit` header;
+- an invalid signature;
+- a wrong `iss` or `aud`, or claims of the wrong JSON type (for example `aud` as an array);
+- `exp` at or before `now - JWT_CLOCK_SKEW_SECONDS`, or `iat` after `now + JWT_CLOCK_SKEW_SECONDS`;
+- a lifetime (`exp - iat`) that is not positive or exceeds 3600 seconds;
+- a missing claim, a non-UUID or nil `sub`, or an unknown `role`;
+- a length over 4 KiB, or anything that is not three base64url segments.
+
+Header URLs and embedded keys (`jku`, `x5u`, `jwk`) are never used. Refresh tokens are opaque strings rather than JWTs, so one can never pass as an access token. The refresh store is never consulted for access-token validation.
+
+**Keys.** Generate a key pair with OpenSSL:
+
+```bash
+openssl genpkey -algorithm ed25519 -outform DER -out jwt-key.der
+base64 -w0 jwt-key.der                                              # JWT_SIGNING_KEY
+openssl pkey -inform DER -in jwt-key.der -pubout -outform DER | base64 -w0   # public key for JWT_VERIFICATION_KEYS
+```
+
+Store the private key in your secret manager, never in the repository. `.env.example` and `compose.yaml` ship a published dev-only key (`kid` `dev-only`). Startup fails if that key is configured as the signing key or a verification key when `APP_ENV` is not `development`. Startup validation errors name the variable but never echo its value. The integration script generates a fresh key for each run.
+
+**Key rotation.** Every replica signs with one key and accepts that key plus `JWT_VERIFICATION_KEYS`:
+
+1. Generate a new key pair. Add `<new-kid>:<new-public>` to `JWT_VERIFICATION_KEYS` on every replica and roll out, so all replicas accept the new key before any replica signs with it.
+2. Set `JWT_SIGNING_KEY_ID`/`JWT_SIGNING_KEY` to the new key, replace the new entry in `JWT_VERIFICATION_KEYS` with `<old-kid>:<old-public>`, and roll out. Tokens issued before the switch keep verifying.
+3. After `JWT_ACCESS_TOKEN_TTL_SECONDS + JWT_CLOCK_SKEW_SECONDS` (at most about an hour), remove the old key.
+
+If a key is compromised, skip the overlap: remove the key everywhere at once. Every token it signed fails immediately, and clients must use their refresh token to get a new access token.
+
+**Limitation: no revocation before expiry.** Access tokens are deliberately stateless. A token stays valid until `exp`, even if the user logs out, is disabled or deleted, or changes role. The role in a principal is a snapshot taken when the token was issued. Exposure is bounded by `JWT_ACCESS_TOKEN_TTL_SECONDS + JWT_CLOCK_SKEW_SECONDS` (15.5 minutes by default). Sensitive operations must also check the account's current status and role in MySQL (AUTH-04). Logout and revocation act on refresh sessions, which stops any further access tokens from being issued.
 
 The Compose OpenSearch service disables its security plugin for local development only. Do not expose it to an untrusted network or copy that setting into a production deployment.
 

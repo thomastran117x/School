@@ -5,9 +5,35 @@
 
 use std::{env, net::SocketAddr, path::PathBuf, str::FromStr, time::Duration};
 
+use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
+use ed25519_dalek::{
+    SigningKey, VerifyingKey,
+    pkcs8::{DecodePrivateKey, DecodePublicKey},
+};
 use sea_orm::sqlx::mysql::{MySqlConnectOptions, MySqlSslMode};
 use thiserror::Error;
 use url::Url;
+
+/// Shortest accepted access-token lifetime.
+pub const MIN_ACCESS_TOKEN_TTL: Duration = Duration::from_secs(60);
+/// Longest accepted access-token lifetime. Verification also rejects any token whose
+/// `exp - iat` exceeds this, whatever the current configuration.
+pub const MAX_ACCESS_TOKEN_TTL: Duration = Duration::from_secs(3600);
+/// Largest accepted clock-skew allowance for access-token time checks.
+pub const MAX_JWT_CLOCK_SKEW: Duration = Duration::from_secs(120);
+/// Maximum number of additional (rotation) verification keys.
+const MAX_JWT_VERIFICATION_KEYS: usize = 4;
+/// Maximum length of a JWT key id.
+const MAX_JWT_KEY_ID_LEN: usize = 64;
+/// Maximum length of the configured issuer and audience.
+const MAX_JWT_IDENTIFIER_LEN: usize = 256;
+/// Raw public key of the development signing key published in `.env.example` and
+/// `compose.yaml`. Anyone can forge tokens with it, so it is refused, as a signing or
+/// verification key, outside [`Environment::Development`].
+const DEV_JWT_PUBLIC_KEY: [u8; 32] = [
+    0x06, 0x59, 0xe7, 0x0b, 0x96, 0x08, 0xd9, 0x10, 0x15, 0x13, 0x70, 0x63, 0x1e, 0x9f, 0x11, 0x91,
+    0x34, 0x82, 0x77, 0x83, 0xf3, 0xee, 0x4b, 0xcf, 0x3b, 0x5b, 0xdd, 0x45, 0x9c, 0x7d, 0x93, 0x6f,
+];
 
 #[derive(Clone)]
 /// Validated settings for the complete API process.
@@ -24,6 +50,8 @@ pub struct Settings {
     pub opensearch: OpenSearchSettings,
     /// Refresh-session lifetime settings.
     pub auth: AuthSettings,
+    /// Access-token (JWT) issuance and verification settings.
+    pub jwt: JwtSettings,
     /// Course catalogue cache lifetimes.
     // Consumed once the catalogue read service constructs its `CourseCache`.
     #[allow(dead_code)]
@@ -230,6 +258,99 @@ pub struct AuthSettings {
     pub refresh_family_max_lifetime: Duration,
 }
 
+#[derive(Clone)]
+/// Settings for signing and verifying EdDSA (Ed25519) access tokens.
+///
+/// Its `Debug` output lists key ids only, never key material.
+pub struct JwtSettings {
+    /// Expected and issued `iss` claim.
+    pub issuer: String,
+    /// Expected and issued `aud` claim.
+    pub audience: String,
+    /// Lifetime of each issued access token, between [`MIN_ACCESS_TOKEN_TTL`] and
+    /// [`MAX_ACCESS_TOKEN_TTL`].
+    pub access_token_ttl: Duration,
+    /// Allowance applied to `exp` and `iat` checks, at most [`MAX_JWT_CLOCK_SKEW`].
+    pub clock_skew: Duration,
+    /// The single key used to sign new tokens; tokens it signed are also accepted.
+    pub signing_key: JwtSigningKey,
+    /// Additional public keys accepted during key rotation. Never used for signing.
+    pub verification_keys: Vec<JwtVerificationKey>,
+}
+
+impl std::fmt::Debug for JwtSettings {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("JwtSettings")
+            .field("issuer", &self.issuer)
+            .field("audience", &self.audience)
+            .field("access_token_ttl", &self.access_token_ttl)
+            .field("clock_skew", &self.clock_skew)
+            .field("signing_key", &self.signing_key)
+            .field("verification_keys", &self.verification_keys)
+            .finish()
+    }
+}
+
+#[cfg(test)]
+impl JwtSettings {
+    /// Parses JWT settings from key-value pairs with `APP_ENV=production`, for tests
+    /// in other modules. Later pairs override earlier ones.
+    pub(crate) fn from_pairs(values: &[(&str, &str)]) -> Result<Self, ConfigError> {
+        let get = |key: &str| {
+            values
+                .iter()
+                .rev()
+                .find(|(name, _)| *name == key)
+                .map(|(_, value)| (*value).to_owned())
+        };
+        jwt_settings(&get, Environment::Production)
+    }
+}
+
+#[derive(Clone)]
+/// The active Ed25519 signing key. `Debug` prints only the key id.
+pub struct JwtSigningKey {
+    /// Key id placed in the `kid` header of every issued token.
+    pub kid: String,
+    /// PKCS#8 DER private key. Secret: never log or serialize it.
+    pkcs8_der: Vec<u8>,
+    /// Raw 32-byte public key derived from the private key.
+    pub public_key: [u8; 32],
+}
+
+impl JwtSigningKey {
+    /// Returns the PKCS#8 DER private key for constructing the signer. Never log it.
+    pub(crate) fn pkcs8_der(&self) -> &[u8] {
+        &self.pkcs8_der
+    }
+}
+
+impl std::fmt::Debug for JwtSigningKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("JwtSigningKey")
+            .field("kid", &self.kid)
+            .field("private_key", &"<redacted>")
+            .finish_non_exhaustive()
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
+/// A verification-only Ed25519 public key, identified by its key id.
+pub struct JwtVerificationKey {
+    /// Key id matched against the token's `kid` header.
+    pub kid: String,
+    /// Raw 32-byte public key.
+    pub public_key: [u8; 32],
+}
+
+impl std::fmt::Debug for JwtVerificationKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("JwtVerificationKey")
+            .field("kid", &self.kid)
+            .finish_non_exhaustive()
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 /// Lifetimes for the course catalogue cache. They bound how stale a cached read can be
 /// when an invalidation is missed (for example because Redis was unreachable).
@@ -390,10 +511,14 @@ impl Settings {
     /// Builds valid settings from fixed local values, for tests in other modules.
     #[cfg(test)]
     pub(crate) fn for_tests() -> Self {
+        use crate::features::auth::access_token::test_keys;
+
         Self::from_source(|key| match key {
             "DATABASE_URL" => Some("mysql://app:secret@localhost/app".to_owned()),
             "REDIS_URL" => Some("rediss://localhost:6379".to_owned()),
             "OPENSEARCH_URL" => Some("http://localhost:9200".to_owned()),
+            "JWT_SIGNING_KEY_ID" => Some(test_keys::PRIMARY_KID.to_owned()),
+            "JWT_SIGNING_KEY" => Some(test_keys::PRIMARY_PRIVATE.to_owned()),
             _ => None,
         })
         .expect("fixed test settings are valid")
@@ -495,6 +620,9 @@ impl Settings {
             return Err(ConfigError::InvalidCourseCacheTtls);
         }
 
+        let environment: Environment = parse(&get, "APP_ENV", "production")?;
+        let jwt = jwt_settings(&get, environment)?;
+
         let settings = Self {
             server_host,
             server_port,
@@ -524,11 +652,12 @@ impl Settings {
                 refresh_token_ttl,
                 refresh_family_max_lifetime,
             },
+            jwt,
             course_cache,
             health_check_timeout: Duration::from_millis(health_check_timeout_ms),
             shutdown_timeout,
             log_filter: optional(&get, "RUST_LOG", "backend_api=info,tower_http=info"),
-            environment: parse(&get, "APP_ENV", "production")?,
+            environment,
             service_name: optional(&get, "SERVICE_NAME", "school-api"),
             http: http_settings(&get)?,
             metrics: metrics_settings(&get)?,
@@ -556,6 +685,129 @@ impl Settings {
             }
         })
     }
+}
+
+/// Loads and validates access-token settings.
+///
+/// Keys are decoded and parsed here so a bad key fails startup with a message that
+/// names the variable but never echoes its value.
+fn jwt_settings(
+    get: &impl Fn(&str) -> Option<String>,
+    environment: Environment,
+) -> Result<JwtSettings, ConfigError> {
+    let issuer = jwt_identifier(get, "JWT_ISSUER")?;
+    let audience = jwt_identifier(get, "JWT_AUDIENCE")?;
+    let access_token_ttl = bounded_seconds(
+        get,
+        "JWT_ACCESS_TOKEN_TTL_SECONDS",
+        "900",
+        MIN_ACCESS_TOKEN_TTL,
+        MAX_ACCESS_TOKEN_TTL,
+    )?;
+    let clock_skew = bounded_seconds(
+        get,
+        "JWT_CLOCK_SKEW_SECONDS",
+        "30",
+        Duration::ZERO,
+        MAX_JWT_CLOCK_SKEW,
+    )?;
+
+    let signing_kid = jwt_key_id("JWT_SIGNING_KEY_ID", required(get, "JWT_SIGNING_KEY_ID")?)?;
+    let pkcs8_der = BASE64
+        .decode(required(get, "JWT_SIGNING_KEY")?.trim())
+        .map_err(|_| ConfigError::InvalidJwtKey("JWT_SIGNING_KEY"))?;
+    let public_key = SigningKey::from_pkcs8_der(&pkcs8_der)
+        .map_err(|_| ConfigError::InvalidJwtKey("JWT_SIGNING_KEY"))?
+        .verifying_key()
+        .to_bytes();
+
+    let mut verification_keys: Vec<JwtVerificationKey> = Vec::new();
+    for entry in csv(get("JWT_VERIFICATION_KEYS")) {
+        let (kid, key) = entry
+            .split_once(':')
+            .ok_or(ConfigError::InvalidJwtKey("JWT_VERIFICATION_KEYS"))?;
+        let kid = jwt_key_id("JWT_VERIFICATION_KEYS", kid.trim().to_owned())?;
+        let der = BASE64
+            .decode(key.trim())
+            .map_err(|_| ConfigError::InvalidJwtKey("JWT_VERIFICATION_KEYS"))?;
+        let public_key = VerifyingKey::from_public_key_der(&der)
+            .map_err(|_| ConfigError::InvalidJwtKey("JWT_VERIFICATION_KEYS"))?
+            .to_bytes();
+        if kid == signing_kid || verification_keys.iter().any(|existing| existing.kid == kid) {
+            return Err(ConfigError::DuplicateJwtKeyId);
+        }
+        verification_keys.push(JwtVerificationKey { kid, public_key });
+    }
+    if verification_keys.len() > MAX_JWT_VERIFICATION_KEYS {
+        return Err(ConfigError::TooManyJwtVerificationKeys);
+    }
+
+    let uses_dev_key = public_key == DEV_JWT_PUBLIC_KEY
+        || verification_keys
+            .iter()
+            .any(|key| key.public_key == DEV_JWT_PUBLIC_KEY);
+    if uses_dev_key && environment != Environment::Development {
+        return Err(ConfigError::DevJwtKeyOutsideDevelopment);
+    }
+
+    Ok(JwtSettings {
+        issuer,
+        audience,
+        access_token_ttl,
+        clock_skew,
+        signing_key: JwtSigningKey {
+            kid: signing_kid,
+            pkcs8_der,
+            public_key,
+        },
+        verification_keys,
+    })
+}
+
+/// Reads an issuer or audience: non-empty, at most 256 characters, no whitespace.
+fn jwt_identifier(
+    get: &impl Fn(&str) -> Option<String>,
+    key: &'static str,
+) -> Result<String, ConfigError> {
+    let value = optional(get, key, "school-api");
+    if value.chars().count() > MAX_JWT_IDENTIFIER_LEN || value.chars().any(char::is_whitespace) {
+        return Err(ConfigError::InvalidValue { key, value });
+    }
+    Ok(value)
+}
+
+/// Validates a key id: 1-64 characters of `A-Z a-z 0-9 . _ -`.
+fn jwt_key_id(key: &'static str, kid: String) -> Result<String, ConfigError> {
+    let valid = !kid.is_empty()
+        && kid.len() <= MAX_JWT_KEY_ID_LEN
+        && kid
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'));
+    if valid {
+        Ok(kid)
+    } else {
+        Err(ConfigError::InvalidJwtKeyId(key))
+    }
+}
+
+/// Parses a whole-second duration that must lie within `min..=max`.
+fn bounded_seconds(
+    get: &impl Fn(&str) -> Option<String>,
+    key: &'static str,
+    default: &str,
+    min: Duration,
+    max: Duration,
+) -> Result<Duration, ConfigError> {
+    let seconds: u64 = parse(get, key, default)?;
+    let value = Duration::from_secs(seconds);
+    if value < min || value > max {
+        return Err(ConfigError::OutOfRange {
+            key,
+            min: min.as_secs(),
+            max: max.as_secs(),
+        });
+    }
+    Ok(value)
 }
 
 /// Loads and validates the metrics listener settings.
@@ -907,6 +1159,36 @@ pub enum ConfigError {
     /// A duration setting was configured as zero milliseconds.
     #[error("{0} must be greater than zero")]
     ZeroDuration(&'static str),
+    /// A numeric setting fell outside its allowed range.
+    #[error("{key} must be between {min} and {max}")]
+    OutOfRange {
+        /// Name of the environment variable.
+        key: &'static str,
+        /// Smallest accepted value.
+        min: u64,
+        /// Largest accepted value.
+        max: u64,
+    },
+    /// A JWT key was not valid base64 or not an Ed25519 key in the expected DER form.
+    /// The value is never included.
+    #[error(
+        "{0} must contain base64-encoded Ed25519 keys (PKCS#8 DER private key, SPKI DER public keys)"
+    )]
+    InvalidJwtKey(&'static str),
+    /// A JWT key id was empty, too long, or used disallowed characters.
+    #[error("{0} contains an invalid key id; use 1-64 characters of A-Z a-z 0-9 . _ -")]
+    InvalidJwtKeyId(&'static str),
+    /// A JWT key id was repeated, or a verification key reused the signing key id.
+    #[error("JWT_VERIFICATION_KEYS must not repeat a key id or reuse JWT_SIGNING_KEY_ID")]
+    DuplicateJwtKeyId,
+    /// More rotation keys were configured than allowed.
+    #[error("JWT_VERIFICATION_KEYS accepts at most 4 keys")]
+    TooManyJwtVerificationKeys,
+    /// The published development key was configured outside development.
+    #[error(
+        "the published development JWT key may only be used with APP_ENV=development; generate a new key"
+    )]
+    DevJwtKeyOutsideDevelopment,
     /// The refresh family lifetime was shorter than the refresh token lifetime.
     #[error("REFRESH_FAMILY_MAX_LIFETIME_SECONDS must be at least REFRESH_TOKEN_TTL_SECONDS")]
     InvalidAuthLifetimes,
@@ -945,6 +1227,7 @@ mod tests {
     use std::collections::HashMap;
 
     use super::*;
+    use crate::features::auth::access_token::test_keys;
 
     fn settings(values: &[(&str, &str)]) -> Result<Settings, ConfigError> {
         let values: HashMap<String, String> = values
@@ -959,6 +1242,8 @@ mod tests {
             ("DATABASE_URL", "mysql://app:secret@localhost/app"),
             ("REDIS_URL", "rediss://localhost:6379"),
             ("OPENSEARCH_URL", "http://localhost:9200"),
+            ("JWT_SIGNING_KEY_ID", test_keys::PRIMARY_KID),
+            ("JWT_SIGNING_KEY", test_keys::PRIMARY_PRIVATE),
         ]
     }
 
@@ -1074,6 +1359,230 @@ mod tests {
             ]),
             Some(ConfigError::InvalidAuthLifetimes)
         );
+    }
+
+    fn jwt_error(extra: &[(&str, &str)]) -> Option<ConfigError> {
+        let mut values: Vec<(&str, &str)> = required_values();
+        values.extend_from_slice(extra);
+        settings(&values).err()
+    }
+
+    #[test]
+    fn loads_jwt_defaults_and_derives_the_public_key() {
+        let loaded = settings(&required_values()).unwrap();
+        let jwt = &loaded.jwt;
+        assert_eq!(jwt.issuer, "school-api");
+        assert_eq!(jwt.audience, "school-api");
+        assert_eq!(jwt.access_token_ttl, Duration::from_secs(15 * 60));
+        assert_eq!(jwt.clock_skew, Duration::from_secs(30));
+        assert_eq!(jwt.signing_key.kid, test_keys::PRIMARY_KID);
+        let spki = BASE64.decode(test_keys::PRIMARY_PUBLIC).unwrap();
+        assert_eq!(jwt.signing_key.public_key, spki[spki.len() - 32..]);
+        assert!(jwt.verification_keys.is_empty());
+    }
+
+    #[test]
+    fn loads_explicit_jwt_settings_and_rotation_keys() {
+        let mut values: Vec<(&str, &str)> = required_values();
+        let rotation = format!(
+            "{}:{}",
+            test_keys::SECONDARY_KID,
+            test_keys::SECONDARY_PUBLIC
+        );
+        values.extend([
+            ("JWT_ISSUER", "https://api.example.edu"),
+            ("JWT_AUDIENCE", "school-web"),
+            ("JWT_ACCESS_TOKEN_TTL_SECONDS", "60"),
+            ("JWT_CLOCK_SKEW_SECONDS", "0"),
+            ("JWT_VERIFICATION_KEYS", rotation.as_str()),
+        ]);
+        let jwt = settings(&values).unwrap().jwt;
+        assert_eq!(jwt.issuer, "https://api.example.edu");
+        assert_eq!(jwt.audience, "school-web");
+        assert_eq!(jwt.access_token_ttl, Duration::from_secs(60));
+        assert_eq!(jwt.clock_skew, Duration::ZERO);
+        assert_eq!(jwt.verification_keys.len(), 1);
+        assert_eq!(jwt.verification_keys[0].kid, test_keys::SECONDARY_KID);
+    }
+
+    #[test]
+    fn requires_a_signing_key_and_key_id() {
+        let without = |key: &str| {
+            let values: Vec<_> = required_values()
+                .into_iter()
+                .filter(|(name, _)| *name != key)
+                .collect();
+            settings(&values).err()
+        };
+        assert_eq!(
+            without("JWT_SIGNING_KEY"),
+            Some(ConfigError::Missing("JWT_SIGNING_KEY"))
+        );
+        assert_eq!(
+            without("JWT_SIGNING_KEY_ID"),
+            Some(ConfigError::Missing("JWT_SIGNING_KEY_ID"))
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_jwt_keys_without_echoing_them() {
+        // RSA-sized garbage, a public key in place of a private one, a truncated
+        // key and invalid base64 are all refused.
+        let truncated = &test_keys::PRIMARY_PRIVATE[..40];
+        for bad in [
+            "not base64!",
+            test_keys::PRIMARY_PUBLIC,
+            truncated,
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+        ] {
+            let error = jwt_error(&[("JWT_SIGNING_KEY", bad)]).unwrap();
+            assert_eq!(error, ConfigError::InvalidJwtKey("JWT_SIGNING_KEY"));
+            assert!(!error.to_string().contains(bad));
+        }
+        for bad in [
+            "no-separator",
+            "kid:not base64!",
+            "kid:MC4CAQAwBQYDK2VwBCIEIOTg18nForUnB/sPZ9TEXP4JFns+uKYA4/qsOg2DIE0y",
+        ] {
+            assert_eq!(
+                jwt_error(&[("JWT_VERIFICATION_KEYS", bad)]),
+                Some(ConfigError::InvalidJwtKey("JWT_VERIFICATION_KEYS"))
+            );
+        }
+    }
+
+    #[test]
+    fn validates_jwt_key_ids() {
+        for kid in ["", "has space", "slash/kid", &"k".repeat(65)] {
+            let mut values: Vec<(&str, &str)> = required_values();
+            values.retain(|(name, _)| *name != "JWT_SIGNING_KEY_ID");
+            values.push(("JWT_SIGNING_KEY_ID", kid));
+            let expected = if kid.is_empty() {
+                ConfigError::Missing("JWT_SIGNING_KEY_ID")
+            } else {
+                ConfigError::InvalidJwtKeyId("JWT_SIGNING_KEY_ID")
+            };
+            assert_eq!(settings(&values).err(), Some(expected), "{kid:?}");
+        }
+        let bad_rotation_kid = format!("bad kid:{}", test_keys::SECONDARY_PUBLIC);
+        let mut values: Vec<(&str, &str)> = required_values();
+        values.push(("JWT_VERIFICATION_KEYS", &bad_rotation_kid));
+        assert_eq!(
+            settings(&values).err(),
+            Some(ConfigError::InvalidJwtKeyId("JWT_VERIFICATION_KEYS"))
+        );
+    }
+
+    #[test]
+    fn rejects_duplicate_and_excess_rotation_keys() {
+        let reuse_signing = format!("{}:{}", test_keys::PRIMARY_KID, test_keys::SECONDARY_PUBLIC);
+        let repeated = format!("old:{0}, old:{0}", test_keys::SECONDARY_PUBLIC);
+        let too_many = (0..5)
+            .map(|index| format!("k{index}:{}", test_keys::SECONDARY_PUBLIC))
+            .collect::<Vec<_>>()
+            .join(",");
+        for (value, expected) in [
+            (reuse_signing.as_str(), ConfigError::DuplicateJwtKeyId),
+            (repeated.as_str(), ConfigError::DuplicateJwtKeyId),
+            (too_many.as_str(), ConfigError::TooManyJwtVerificationKeys),
+        ] {
+            let mut values: Vec<(&str, &str)> = required_values();
+            values.push(("JWT_VERIFICATION_KEYS", value));
+            assert_eq!(settings(&values).err(), Some(expected), "{value}");
+        }
+    }
+
+    #[test]
+    fn bounds_jwt_lifetimes_and_skew() {
+        for (key, value) in [
+            ("JWT_ACCESS_TOKEN_TTL_SECONDS", "59"),
+            ("JWT_ACCESS_TOKEN_TTL_SECONDS", "3601"),
+            ("JWT_ACCESS_TOKEN_TTL_SECONDS", "0"),
+            ("JWT_CLOCK_SKEW_SECONDS", "121"),
+        ] {
+            assert!(
+                matches!(
+                    jwt_error(&[(key, value)]),
+                    Some(ConfigError::OutOfRange { key: k, .. }) if k == key
+                ),
+                "{key}={value}"
+            );
+        }
+        assert!(matches!(
+            jwt_error(&[("JWT_ACCESS_TOKEN_TTL_SECONDS", "-1")]),
+            Some(ConfigError::InvalidValue { .. })
+        ));
+        assert!(jwt_error(&[("JWT_ACCESS_TOKEN_TTL_SECONDS", "3600")]).is_none());
+        assert!(jwt_error(&[("JWT_CLOCK_SKEW_SECONDS", "120")]).is_none());
+    }
+
+    #[test]
+    fn validates_issuer_and_audience() {
+        let long = "i".repeat(257);
+        for (key, value) in [
+            ("JWT_ISSUER", "has space"),
+            ("JWT_AUDIENCE", "tab\there"),
+            ("JWT_ISSUER", long.as_str()),
+        ] {
+            let mut values: Vec<(&str, &str)> = required_values();
+            values.push((key, value));
+            assert!(
+                matches!(
+                    settings(&values).err(),
+                    Some(ConfigError::InvalidValue { key: k, .. }) if k == key
+                ),
+                "{key}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_published_dev_key_is_refused_outside_development() {
+        let mut values: Vec<(&str, &str)> = required_values();
+        values.retain(|(name, _)| *name != "JWT_SIGNING_KEY");
+        values.push(("JWT_SIGNING_KEY", test_keys::DEV_PRIVATE));
+        for environment in ["production", "staging"] {
+            let mut values = values.clone();
+            values.push(("APP_ENV", environment));
+            assert_eq!(
+                settings(&values).err(),
+                Some(ConfigError::DevJwtKeyOutsideDevelopment),
+                "{environment}"
+            );
+        }
+        let mut development = values.clone();
+        development.push(("APP_ENV", "development"));
+        assert!(settings(&development).is_ok());
+
+        // Trusting the dev public key for verification is just as unsafe.
+        let rotation = format!("dev:{}", test_keys::DEV_PUBLIC);
+        assert_eq!(
+            jwt_error(&[("JWT_VERIFICATION_KEYS", &rotation)]),
+            Some(ConfigError::DevJwtKeyOutsideDevelopment)
+        );
+    }
+
+    #[test]
+    fn jwt_settings_debug_output_is_redacted() {
+        let rotation = format!(
+            "{}:{}",
+            test_keys::SECONDARY_KID,
+            test_keys::SECONDARY_PUBLIC
+        );
+        let mut values: Vec<(&str, &str)> = required_values();
+        values.push(("JWT_VERIFICATION_KEYS", &rotation));
+        let rendered = format!("{:?}", settings(&values).unwrap().jwt);
+        assert!(rendered.contains(test_keys::PRIMARY_KID), "{rendered}");
+        assert!(rendered.contains(test_keys::SECONDARY_KID), "{rendered}");
+        assert!(rendered.contains("<redacted>"), "{rendered}");
+        for secret in [
+            test_keys::PRIMARY_PRIVATE,
+            test_keys::PRIMARY_PUBLIC,
+            test_keys::SECONDARY_PUBLIC,
+        ] {
+            assert!(!rendered.contains(secret), "{rendered}");
+        }
+        assert!(!rendered.contains("public_key"), "{rendered}");
     }
 
     #[test]

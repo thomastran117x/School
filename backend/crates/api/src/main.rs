@@ -21,7 +21,8 @@ use std::sync::Arc;
 
 use anyhow::Context;
 use features::{
-    auth::refresh_store::RedisRefreshSessionStore, courses::cache::CourseCache,
+    auth::{access_token::AccessTokenService, refresh_store::RedisRefreshSessionStore},
+    courses::cache::CourseCache,
     health::DatastoreHealthService,
 };
 use infrastructure::Datastores;
@@ -43,6 +44,13 @@ async fn main() -> anyhow::Result<()> {
         redis.clone(),
         settings.auth.clone(),
     ));
+    let access_tokens = Arc::new(AccessTokenService::new(&settings.jwt));
+    tracing::info!(
+        signing_kid = access_tokens.signing_key_id(),
+        accepted_keys = 1 + settings.jwt.verification_keys.len(),
+        ttl_seconds = access_tokens.token_ttl().as_secs(),
+        "access token service ready"
+    );
     let course_cache = Arc::new(CourseCache::new(
         redis.clone(),
         settings.course_cache.clone(),
@@ -69,6 +77,7 @@ async fn main() -> anyhow::Result<()> {
         opensearch,
         health,
         refresh_sessions,
+        access_tokens,
         course_cache,
         metrics: metrics.clone(),
         rate_limiter,
