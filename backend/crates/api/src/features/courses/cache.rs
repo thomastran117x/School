@@ -3,7 +3,7 @@
 //! MySQL is the source of truth; Redis only accelerates display reads. The cache is
 //! therefore **fail-open**: any Redis error is logged and the read falls back to the
 //! database loader supplied by the caller. Nothing here may be used to make
-//! authorization or application-acceptance decisions: those paths must read the
+//! authorization or access decisions (such as "is this course published?"): those paths must read the
 //! database directly (see the "Course catalogue cache" section of the backend README).
 //!
 //! # Keys
@@ -27,7 +27,7 @@
 //!
 //! A reader records the counter *before* reading the database and fills the cache with
 //! a script that only writes if the counter is unchanged. A read that raced with a
-//! deactivation therefore can never re-cache the pre-deactivation row.
+//! status change (for example archiving) therefore can never re-cache the earlier row.
 //!
 //! If invalidation itself fails (Redis down), staleness is bounded by the configured
 //! TTLs (`COURSE_CACHE_*_TTL_SECONDS`).
@@ -158,8 +158,8 @@ impl CourseCache {
 
     /// Invalidates everything cached for one course and every catalogue listing.
     ///
-    /// Call this **after** the database change commits (create, update, deactivate,
-    /// reactivate). One retry is attempted before the failure is reported; callers
+    /// Call this **after** the database change commits (create, update, or a status
+    /// change such as publish, archive, or restore). One retry is attempted before the failure is reported; callers
     /// should log the error and may rely on the TTLs as the staleness bound.
     ///
     /// # Errors

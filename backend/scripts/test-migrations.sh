@@ -53,8 +53,8 @@ assert_schema_contract() {
 
     assert_scalar \
         "binary UUID columns" \
-        "11" \
-        "SELECT COUNT(*) FROM information_schema.columns WHERE table_schema = DATABASE() AND data_type = 'binary' AND character_maximum_length = 16 AND CONCAT(table_name, '.', column_name) IN ('users.id', 'local_credentials.user_id', 'external_identities.id', 'external_identities.user_id', 'courses.id', 'applications.id', 'applications.student_id', 'applications.course_id', 'application_reviews.id', 'application_reviews.application_id', 'application_reviews.reviewer_id');"
+        "12" \
+        "SELECT COUNT(*) FROM information_schema.columns WHERE table_schema = DATABASE() AND data_type = 'binary' AND character_maximum_length = 16 AND CONCAT(table_name, '.', column_name) IN ('users.id', 'local_credentials.user_id', 'external_identities.id', 'external_identities.user_id', 'courses.id', 'courses.owner_user_id', 'applications.id', 'applications.student_id', 'applications.course_id', 'application_reviews.id', 'application_reviews.application_id', 'application_reviews.reviewer_id');"
 
     assert_scalar \
         "password hash columns (only in local_credentials)" \
@@ -63,8 +63,8 @@ assert_schema_contract() {
 
     assert_scalar \
         "audit-preserving foreign keys" \
-        "4" \
-        "SELECT COUNT(*) FROM information_schema.referential_constraints WHERE constraint_schema = DATABASE() AND constraint_name IN ('fk_applications_student', 'fk_applications_course', 'fk_application_reviews_application', 'fk_application_reviews_reviewer') AND update_rule = 'RESTRICT' AND delete_rule = 'RESTRICT';"
+        "5" \
+        "SELECT COUNT(*) FROM information_schema.referential_constraints WHERE constraint_schema = DATABASE() AND constraint_name IN ('fk_courses_owner', 'fk_applications_student', 'fk_applications_course', 'fk_application_reviews_application', 'fk_application_reviews_reviewer') AND update_rule = 'RESTRICT' AND delete_rule = 'RESTRICT';"
 
     assert_scalar \
         "auth-only cascading foreign keys" \
@@ -73,23 +73,23 @@ assert_schema_contract() {
 
     assert_scalar \
         "all foreign keys" \
-        "6" \
+        "7" \
         "SELECT COUNT(*) FROM information_schema.referential_constraints WHERE constraint_schema = DATABASE();"
 
     assert_scalar \
         "named check constraints" \
-        "15" \
-        "SELECT COUNT(*) FROM information_schema.table_constraints WHERE constraint_schema = DATABASE() AND constraint_type = 'CHECK' AND constraint_name IN ('ck_users_role', 'ck_users_account_status', 'ck_users_deleted_state', 'ck_users_deletion_requested', 'ck_users_email_presence', 'ck_users_verification_state', 'ck_local_credentials_algorithm', 'ck_local_credentials_hash_format', 'ck_external_identities_provider', 'ck_external_identities_subject_not_empty', 'ck_external_identities_tenant', 'ck_courses_capacity', 'ck_courses_is_active', 'ck_applications_status', 'ck_application_reviews_decision');"
+        "20" \
+        "SELECT COUNT(*) FROM information_schema.table_constraints WHERE constraint_schema = DATABASE() AND constraint_type = 'CHECK' AND constraint_name IN ('ck_users_role', 'ck_users_account_status', 'ck_users_deleted_state', 'ck_users_deletion_requested', 'ck_users_email_presence', 'ck_users_verification_state', 'ck_local_credentials_algorithm', 'ck_local_credentials_hash_format', 'ck_external_identities_provider', 'ck_external_identities_subject_not_empty', 'ck_external_identities_tenant', 'ck_courses_status', 'ck_courses_title_not_blank', 'ck_courses_code_not_blank', 'ck_courses_term_not_blank', 'ck_courses_description_length', 'ck_courses_published_state', 'ck_courses_archived_state', 'ck_applications_status', 'ck_application_reviews_decision');"
 
     assert_scalar \
         "domain uniqueness constraints" \
         "6" \
-        "SELECT COUNT(*) FROM information_schema.table_constraints WHERE constraint_schema = DATABASE() AND constraint_type = 'UNIQUE' AND constraint_name IN ('uq_users_normalized_email', 'uq_external_identities_provider_subject', 'uq_external_identities_user_provider', 'uq_courses_code', 'uq_applications_student_course', 'uq_application_reviews_application_id');"
+        "SELECT COUNT(*) FROM information_schema.table_constraints WHERE constraint_schema = DATABASE() AND constraint_type = 'UNIQUE' AND constraint_name IN ('uq_users_normalized_email', 'uq_external_identities_provider_subject', 'uq_external_identities_user_provider', 'uq_courses_owner_code_term', 'uq_applications_student_course', 'uq_application_reviews_application_id');"
 
     assert_scalar \
         "query indexes" \
-        "6" \
-        "SELECT COUNT(DISTINCT index_name) FROM information_schema.statistics WHERE table_schema = DATABASE() AND index_name IN ('idx_users_deletion_queue', 'idx_courses_availability', 'idx_applications_student_submitted_at', 'idx_applications_course_status', 'idx_applications_status_submitted_at', 'idx_application_reviews_reviewer_reviewed_at');"
+        "7" \
+        "SELECT COUNT(DISTINCT index_name) FROM information_schema.statistics WHERE table_schema = DATABASE() AND index_name IN ('idx_users_deletion_queue', 'idx_courses_owner_status', 'idx_courses_status_created_at', 'idx_applications_student_submitted_at', 'idx_applications_course_status', 'idx_applications_status_submitted_at', 'idx_application_reviews_reviewer_reviewed_at');"
 }
 
 assert_data_contract() {
@@ -102,8 +102,8 @@ assert_data_contract() {
         VALUES (UNHEX('00000000000070008000000000000002'), 'admin@example.com', 'admin@example.com', 'Administrator', 'ADMIN', 'ACTIVE', CURRENT_TIMESTAMP(6));
         INSERT INTO external_identities (id, user_id, provider, provider_subject)
         VALUES (UNHEX('00000000000070008000000000000011'), UNHEX('00000000000070008000000000000001'), 'GOOGLE', 'CaseSensitiveSubject');
-        INSERT INTO courses (id, code, name, description, capacity, application_deadline)
-        VALUES (UNHEX('00000000000070008000000000000021'), 'CSC101', 'Introduction to Computing', 'Foundational computing course', 30, '2030-09-01 12:00:00.000000');
+        INSERT INTO courses (id, owner_user_id, title, code, term, description)
+        VALUES (UNHEX('00000000000070008000000000000021'), UNHEX('00000000000070008000000000000002'), 'Introduction to Computing', 'CSC101', 'Fall 2030', 'Foundational computing course');
         INSERT INTO applications (id, student_id, course_id)
         VALUES (UNHEX('00000000000070008000000000000031'), UNHEX('00000000000070008000000000000001'), UNHEX('00000000000070008000000000000021'));
         UPDATE applications SET status = 'ACCEPTED' WHERE id = UNHEX('00000000000070008000000000000031');
@@ -137,6 +137,21 @@ assert_data_contract() {
         VALUES (UNHEX('0000000000007000800000000000000B'), '${ARGON2ID_HASH}');
         INSERT INTO external_identities (id, user_id, provider, provider_subject)
         VALUES (UNHEX('00000000000070008000000000000016'), UNHEX('0000000000007000800000000000000B'), 'GOOGLE', 'purge-subject');
+
+        -- Course uniqueness is per owner: another owner may reuse a code and term,
+        -- courses without a code are unconstrained, and a code may repeat across terms.
+        INSERT INTO courses (id, owner_user_id, title, code, term, description)
+        VALUES (UNHEX('00000000000070008000000000000061'), UNHEX('00000000000070008000000000000001'), 'Parallel Section', 'CSC101', 'Fall 2030', '');
+        INSERT INTO courses (id, owner_user_id, title, description)
+        VALUES (UNHEX('00000000000070008000000000000062'), UNHEX('00000000000070008000000000000002'), 'Uncoded A', '');
+        INSERT INTO courses (id, owner_user_id, title, description)
+        VALUES (UNHEX('00000000000070008000000000000063'), UNHEX('00000000000070008000000000000002'), 'Uncoded B', '');
+        INSERT INTO courses (id, owner_user_id, title, code, term, description)
+        VALUES (UNHEX('00000000000070008000000000000064'), UNHEX('00000000000070008000000000000002'), 'Next Offering', 'CSC101', 'Winter 2031', '');
+        INSERT INTO courses (id, owner_user_id, title, code, description)
+        VALUES (UNHEX('00000000000070008000000000000065'), UNHEX('00000000000070008000000000000002'), 'Termless', 'MAT200', '');
+        INSERT INTO courses (id, owner_user_id, title, description)
+        VALUES (UNHEX('00000000000070008000000000000066'), UNHEX('00000000000070008000000000000007'), 'Owned by OAuth user', REPEAT('d', 10000));
     "
 
     assert_scalar \
@@ -160,9 +175,13 @@ assert_data_contract() {
         "2" \
         "SELECT COUNT(*) FROM users WHERE account_status = 'DELETED' AND email IS NULL AND normalized_email IS NULL;"
     assert_scalar \
-        "course active default" \
-        "1" \
-        "SELECT is_active FROM courses WHERE id = UNHEX('00000000000070008000000000000021');"
+        "course lifecycle defaults" \
+        "DRAFT:1:1" \
+        "SELECT CONCAT(status, ':', published_at IS NULL, ':', archived_at IS NULL) FROM courses WHERE id = UNHEX('00000000000070008000000000000021');"
+    assert_scalar \
+        "courses sharing CSC101 across owners and terms" \
+        "3" \
+        "SELECT COUNT(*) FROM courses WHERE code = 'csc101';"
     assert_scalar \
         "one persisted review" \
         "1" \
@@ -254,14 +273,72 @@ assert_data_contract() {
 
     # Courses, applications, and reviews.
     expect_rejected \
-        "a case-insensitive duplicate course code" \
-        "INSERT INTO courses (id, code, name, description, capacity, application_deadline) VALUES (UNHEX('00000000000070008000000000000022'), 'csc101', 'Duplicate', 'Duplicate code', 1, '2030-09-01 12:00:00.000000');"
+        "an owner reusing a course code and term case-insensitively" \
+        "INSERT INTO courses (id, owner_user_id, title, code, term, description) VALUES (UNHEX('00000000000070008000000000000070'), UNHEX('00000000000070008000000000000002'), 'Duplicate', 'csc101', 'fall 2030', '');"
     expect_rejected \
-        "a zero-capacity course" \
-        "INSERT INTO courses (id, code, name, description, capacity, application_deadline) VALUES (UNHEX('00000000000070008000000000000023'), 'ZERO101', 'Zero Capacity', 'Invalid capacity', 0, '2030-09-01 12:00:00.000000');"
+        "an owner reusing a course code without a term" \
+        "INSERT INTO courses (id, owner_user_id, title, code, description) VALUES (UNHEX('00000000000070008000000000000071'), UNHEX('00000000000070008000000000000002'), 'Duplicate', 'mat200', '');"
     expect_rejected \
-        "a non-boolean active value" \
-        "INSERT INTO courses (id, code, name, description, capacity, application_deadline, is_active) VALUES (UNHEX('00000000000070008000000000000024'), 'ACTIVE101', 'Invalid Active', 'Invalid active flag', 1, '2030-09-01 12:00:00.000000', 2);"
+        "a course for an unknown owner" \
+        "INSERT INTO courses (id, owner_user_id, title, description) VALUES (UNHEX('00000000000070008000000000000072'), UNHEX('00000000000070008000000000000099'), 'Orphan', '');"
+    expect_rejected \
+        "an empty course title" \
+        "INSERT INTO courses (id, owner_user_id, title, description) VALUES (UNHEX('00000000000070008000000000000073'), UNHEX('00000000000070008000000000000002'), '', '');"
+    expect_rejected \
+        "a whitespace-only course title" \
+        "INSERT INTO courses (id, owner_user_id, title, description) VALUES (UNHEX('00000000000070008000000000000073'), UNHEX('00000000000070008000000000000002'), '   ', '');"
+    expect_rejected \
+        "an over-long course title" \
+        "INSERT INTO courses (id, owner_user_id, title, description) VALUES (UNHEX('00000000000070008000000000000073'), UNHEX('00000000000070008000000000000002'), REPEAT('t', 201), '');"
+    expect_rejected \
+        "a whitespace-only course code" \
+        "INSERT INTO courses (id, owner_user_id, title, code, description) VALUES (UNHEX('00000000000070008000000000000074'), UNHEX('00000000000070008000000000000002'), 'Blank Code', '  ', '');"
+    expect_rejected \
+        "an empty course term" \
+        "INSERT INTO courses (id, owner_user_id, title, term, description) VALUES (UNHEX('00000000000070008000000000000075'), UNHEX('00000000000070008000000000000002'), 'Blank Term', '', '');"
+    expect_rejected \
+        "an over-long course description" \
+        "INSERT INTO courses (id, owner_user_id, title, description) VALUES (UNHEX('00000000000070008000000000000076'), UNHEX('00000000000070008000000000000002'), 'Long', REPEAT('d', 10001));"
+    expect_rejected \
+        "an invalid course status" \
+        "INSERT INTO courses (id, owner_user_id, title, description, status) VALUES (UNHEX('00000000000070008000000000000077'), UNHEX('00000000000070008000000000000002'), 'Bad Status', '', 'DELETED');"
+    expect_rejected \
+        "a non-canonical course status" \
+        "INSERT INTO courses (id, owner_user_id, title, description, status) VALUES (UNHEX('00000000000070008000000000000077'), UNHEX('00000000000070008000000000000002'), 'Bad Status', '', 'draft');"
+    expect_rejected \
+        "a published course without a publication time" \
+        "UPDATE courses SET status = 'PUBLISHED' WHERE id = UNHEX('00000000000070008000000000000062');"
+    expect_rejected \
+        "a draft course with a publication time" \
+        "UPDATE courses SET published_at = CURRENT_TIMESTAMP(6) WHERE id = UNHEX('00000000000070008000000000000062');"
+    expect_rejected \
+        "an archived course without an archive time" \
+        "UPDATE courses SET status = 'ARCHIVED' WHERE id = UNHEX('00000000000070008000000000000062');"
+    expect_rejected \
+        "an archive time on a course that is not archived" \
+        "UPDATE courses SET archived_at = CURRENT_TIMESTAMP(6) WHERE id = UNHEX('00000000000070008000000000000062');"
+    expect_rejected \
+        "a direct write to the generated term key" \
+        "INSERT INTO courses (id, owner_user_id, title, description, term_key) VALUES (UNHEX('00000000000070008000000000000078'), UNHEX('00000000000070008000000000000002'), 'Term Key', '', 'x');"
+
+    # Publishing, archiving, and restoring are status changes that keep history.
+    mysql_query "
+        UPDATE courses SET status = 'PUBLISHED', published_at = CURRENT_TIMESTAMP(6) WHERE id = UNHEX('00000000000070008000000000000021');
+        UPDATE courses SET status = 'ARCHIVED', archived_at = CURRENT_TIMESTAMP(6) WHERE id = UNHEX('00000000000070008000000000000021');
+        UPDATE courses SET status = 'ARCHIVED', archived_at = CURRENT_TIMESTAMP(6) WHERE id = UNHEX('00000000000070008000000000000064');
+    "
+    assert_scalar \
+        "applications of an archived course" \
+        "ARCHIVED:2" \
+        "SELECT CONCAT(c.status, ':', COUNT(a.id)) FROM courses c LEFT JOIN applications a ON a.course_id = c.id WHERE c.id = UNHEX('00000000000070008000000000000021') GROUP BY c.id, c.status;"
+    mysql_query "UPDATE courses SET status = 'PUBLISHED', archived_at = NULL WHERE id = UNHEX('00000000000070008000000000000021');"
+    assert_scalar \
+        "a restored course keeps its first publication time" \
+        "PUBLISHED:0:1" \
+        "SELECT CONCAT(status, ':', published_at IS NULL, ':', archived_at IS NULL) FROM courses WHERE id = UNHEX('00000000000070008000000000000021');"
+    expect_rejected \
+        "an owner reusing an archived course's code and term" \
+        "INSERT INTO courses (id, owner_user_id, title, code, term, description) VALUES (UNHEX('00000000000070008000000000000079'), UNHEX('00000000000070008000000000000002'), 'Reuse', 'CSC101', 'Winter 2031', '');"
     expect_rejected \
         "a duplicate student-course application" \
         "INSERT INTO applications (id, student_id, course_id) VALUES (UNHEX('00000000000070008000000000000032'), UNHEX('00000000000070008000000000000001'), UNHEX('00000000000070008000000000000021'));"
@@ -298,6 +375,16 @@ assert_data_contract() {
     expect_rejected \
         "changing a referenced user id" \
         "UPDATE users SET id = UNHEX('00000000000070008000000000000098') WHERE id = UNHEX('00000000000070008000000000000007');"
+    expect_rejected \
+        "hard deletion of a user who owns a course" \
+        "DELETE FROM users WHERE id = UNHEX('00000000000070008000000000000007');"
+    assert_scalar \
+        "identities of a course owner after a refused deletion" \
+        "2" \
+        "SELECT COUNT(*) FROM external_identities WHERE user_id = UNHEX('00000000000070008000000000000007');"
+    expect_rejected \
+        "changing a course owner to an unknown user" \
+        "UPDATE courses SET owner_user_id = UNHEX('00000000000070008000000000000099') WHERE id = UNHEX('00000000000070008000000000000066');"
     expect_rejected \
         "hard deletion of a referenced course" \
         "DELETE FROM courses WHERE id = UNHEX('00000000000070008000000000000021');"

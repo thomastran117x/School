@@ -247,7 +247,7 @@ Refresh sessions are auth-critical and share Redis with disposable caches. Full 
 
 ### Course catalogue cache
 
-`features/courses/cache.rs` provides cache-aside reads for the course catalogue. MySQL is the source of truth; Redis only speeds up display reads and is **never** consulted for authorization or application-acceptance decisions (for example "is this course active and open for applications?"), which must read MySQL directly.
+`features/courses/cache.rs` provides cache-aside reads for the course catalogue. MySQL is the source of truth; Redis only speeds up display reads and is **never** consulted for authorization or access decisions (for example "is this course published?"), which must read MySQL directly.
 
 **Read path.** `CourseCache::detail` and `CourseCache::list` look up Redis, and on a miss call the caller's database loader, then fill the cache best-effort. Any Redis failure (unavailable, timeout, undecodable payload) is logged without keys or values and the read falls back to the loader, so a Redis outage degrades performance but not correctness or availability. Loader (database) errors propagate and are never cached. A "course not found" result is cached for the shorter negative TTL.
 
@@ -260,9 +260,9 @@ Refresh sessions are auth-critical and share Redis with disposable caches. Full 
 | `ver.v1.<course_id>` | 24 hours | Per-course change counter that guards fills |
 | `gen.v1` | 24 hours | Catalogue generation embedded in listing keys |
 
-**Invalidation.** After the database change commits, writers call `CourseCache::invalidate_course(id)` for any create, update, deactivation, or reactivation. It atomically deletes the detail entry and bumps the course counter and the catalogue generation, which orphans every cached listing page without scanning (orphans expire by TTL). `invalidate_catalogue()` is available for bulk changes. Invalidation is retried once; if Redis is still down, the error is returned and logged, and staleness is bounded by the TTLs above.
+**Invalidation.** After the database change commits, writers call `CourseCache::invalidate_course(id)` for any create, update, or status change (publish, archive, restore). It atomically deletes the detail entry and bumps the course counter and the catalogue generation, which orphans every cached listing page without scanning (orphans expire by TTL). `invalidate_catalogue()` is available for bulk changes. Invalidation is retried once; if Redis is still down, the error is returned and logged, and staleness is bounded by the TTLs above.
 
-**Stale-fill protection.** Readers record the counter before querying MySQL and fill the cache with a Lua script that writes only if the counter is unchanged. A read that overlaps a deactivation therefore cannot re-cache the pre-deactivation row. Invalidation itself is an unconditional `MULTI`/`EXEC` group built with `Cache::atomic`. The scripts assume a single Redis node; a clustered deployment would need hash tags.
+**Stale-fill protection.** Readers record the counter before querying MySQL and fill the cache with a Lua script that writes only if the counter is unchanged. A read that overlaps a status change, such as archiving, therefore cannot re-cache the earlier row. Invalidation itself is an unconditional `MULTI`/`EXEC` group built with `Cache::atomic`. The scripts assume a single Redis node; a clustered deployment would need hash tags.
 
 ### Identity model
 
@@ -330,9 +330,9 @@ The Compose OpenSearch service disables its security plugin for local developmen
 
 The migration crate owns the authoritative MySQL schema for users, local credentials, external identities, courses, applications, and application reviews. Migrations never run implicitly during API startup; run them as an explicit release step before deploying application instances that depend on the new schema.
 
-All primary and foreign keys use application-generated UUIDv7 values stored as `BINARY(16)`. Application timestamps are UTC `DATETIME(6)` values. The database enforces account roles and states, application and review states, positive course capacity, unique emails and course codes, one application per student and course, one final review per application, and audit-preserving foreign keys. The identity tables are described in [Identity schema](#identity-schema).
+All primary and foreign keys use application-generated UUIDv7 values stored as `BINARY(16)`. Application timestamps are UTC `DATETIME(6)` values. The database enforces account roles and states, the course lifecycle, per-owner course code uniqueness, application and review states, unique emails, one application per student and course, one final review per application, and audit-preserving foreign keys. The identity tables are described in [Identity schema](#identity-schema), and courses in [Course schema](#course-schema).
 
-> **Identity schema rewrite.** Migrations `000001_create_users` and `000002_create_external_identities` were rewritten in place, and `000006_create_local_credentials` was added. A local database that applied the earlier versions must be rebuilt with `cargo run -p migration -- fresh`. Do this only against a disposable development database, because it drops all data.
+> **Schema rewrites.** Migrations `000001_create_users`, `000002_create_external_identities`, and `000003_create_courses` were rewritten in place, and `000006_create_local_credentials` was added. A local database that applied the earlier versions must be rebuilt with `cargo run -p migration -- fresh`. Do this only against a disposable development database, because it drops all data.
 
 ### Identity schema
 
@@ -373,6 +373,49 @@ A user with no `local_credentials` row is OAuth-only. `users` holds no secret ma
 - Linking is allowed only from an authenticated session after recent reauthentication.
 - A user cannot unlink their last remaining sign-in method.
 - `users.id` and `provider_subject` are immutable. `ON UPDATE RESTRICT` protects referenced IDs, and the Rust layer exposes no update path. Triggers are not used, because creating them on servers with binary logging requires elevated privileges.
+
+### Course schema
+
+A course is a learning course owned by a user, not an application-only offering. The legacy `applications` and `application_reviews` tables still reference `courses.id`, but new course features must not build on that workflow.
+
+| Column | Type | Rules |
+| --- | --- | --- |
+| `id` | `BINARY(16)` | Immutable application-generated UUIDv7 |
+| `owner_user_id` | `BINARY(16)` | FK `fk_courses_owner` → `users.id`, `ON UPDATE RESTRICT ON DELETE RESTRICT` |
+| `title` | `VARCHAR(200)` | Required; not blank after trimming |
+| `code` | `VARCHAR(32)`, case/accent-insensitive | Optional (for example `CSC101`); not blank when present |
+| `term` | `VARCHAR(64)`, case/accent-insensitive | Optional (for example `Fall 2026`); not blank when present |
+| `term_key` | generated, `COALESCE(term, '')` | Internal uniqueness key; never written and not mapped by the entity |
+| `description` | `TEXT` | Required, may be empty; at most 10 000 characters |
+| `status` | `VARCHAR(16)` | `DRAFT` (default), `PUBLISHED`, or `ARCHIVED` |
+| `published_at`, `archived_at` | `DATETIME(6)` | Lifecycle timestamps, below |
+| `created_at`, `updated_at` | `DATETIME(6)` | Maintained by MySQL |
+
+Indexes: `idx_courses_owner_status (owner_user_id, status, created_at)` serves "my courses" listings and also covers the owner FK, and `idx_courses_status_created_at (status, created_at)` serves catalogue listings by status.
+
+**Lifecycle.** `DRAFT → PUBLISHED ⇄ ARCHIVED`. A draft may also be archived directly. A published course never returns to `DRAFT`, so it cannot disappear from its members. The database enforces:
+
+- `PUBLISHED` requires `published_at`, and `DRAFT` forbids it. `published_at` records the first publication and is kept through archive and restore.
+- `archived_at` is set exactly while the course is `ARCHIVED`, and it is cleared on restore.
+
+**Uniqueness (`uq_courses_owner_code_term`).**
+
+- One owner cannot have two courses with the same `code` in the same `term`.
+- Comparison is case- and accent-insensitive, so `CSC101`/`csc101` and `Fall 2026`/`fall 2026` collide.
+- A missing term is its own value: an owner can have one termless `MAT200`. The generated `term_key` exists because MySQL `UNIQUE` ignores `NULL`.
+- Courses without a code are never constrained.
+- Different owners may share a code and term, for example parallel sections.
+- The rule also covers archived courses, so an archived offering keeps its code and term.
+
+**Retention.** Publishing, archiving, and restoring are status changes only and never delete rows. A course owner is tombstoned like any other user and cannot be hard-deleted while owning courses. Future coursework and membership tables must reference `courses` with `ON DELETE RESTRICT`, so archiving keeps their history intact.
+
+**Rust model** (`crates/api/src/features/courses/`):
+
+- `entities::course` maps the table. It does not derive `Serialize`, and it relates to the owning `user`.
+- `NewCourse` trims and bounds title, code, and term (counted in characters, with control characters rejected) and bounds the description. It always inserts `DRAFT` with a fresh UUIDv7, with no ID or status input.
+- `transition_status` applies `CourseStatus::can_transition_to` and sets only `status`, `published_at`, and `archived_at`, consistent with the checks above.
+
+**Future extensions.** Application deadlines, seat capacity, and enrollment policy are intentionally absent from the initial LMS. If they are needed, add them through a forward migration, either as nullable columns or a separate enrollment-policy table, and do not revive the legacy application workflow.
 
 For local development, apply and inspect migrations with:
 
