@@ -33,6 +33,17 @@ assert_scalar() {
     fi
 }
 
+assert_index_candidate() {
+    local description=$1
+    local index=$2
+    local query=$3
+
+    if ! mysql_query "EXPLAIN ${query}" | grep -q "${index}"; then
+        echo "Expected ${description} to be able to use ${index}." >&2
+        return 1
+    fi
+}
+
 expect_rejected() {
     local description=$1
     local statement=$2
@@ -43,18 +54,18 @@ expect_rejected() {
     fi
 }
 
-DOMAIN_TABLES="'users', 'local_credentials', 'external_identities', 'courses', 'applications', 'application_reviews'"
+DOMAIN_TABLES="'users', 'local_credentials', 'external_identities', 'courses', 'course_memberships'"
 
 assert_schema_contract() {
     assert_scalar \
         "the number of domain tables" \
-        "6" \
+        "5" \
         "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = DATABASE() AND table_name IN (${DOMAIN_TABLES});"
 
     assert_scalar \
         "binary UUID columns" \
-        "12" \
-        "SELECT COUNT(*) FROM information_schema.columns WHERE table_schema = DATABASE() AND data_type = 'binary' AND character_maximum_length = 16 AND CONCAT(table_name, '.', column_name) IN ('users.id', 'local_credentials.user_id', 'external_identities.id', 'external_identities.user_id', 'courses.id', 'courses.owner_user_id', 'applications.id', 'applications.student_id', 'applications.course_id', 'application_reviews.id', 'application_reviews.application_id', 'application_reviews.reviewer_id');"
+        "8" \
+        "SELECT COUNT(*) FROM information_schema.columns WHERE table_schema = DATABASE() AND data_type = 'binary' AND character_maximum_length = 16 AND CONCAT(table_name, '.', column_name) IN ('users.id', 'local_credentials.user_id', 'external_identities.id', 'external_identities.user_id', 'courses.id', 'courses.owner_user_id', 'course_memberships.course_id', 'course_memberships.user_id');"
 
     assert_scalar \
         "password hash columns (only in local_credentials)" \
@@ -63,8 +74,8 @@ assert_schema_contract() {
 
     assert_scalar \
         "audit-preserving foreign keys" \
-        "5" \
-        "SELECT COUNT(*) FROM information_schema.referential_constraints WHERE constraint_schema = DATABASE() AND constraint_name IN ('fk_courses_owner', 'fk_applications_student', 'fk_applications_course', 'fk_application_reviews_application', 'fk_application_reviews_reviewer') AND update_rule = 'RESTRICT' AND delete_rule = 'RESTRICT';"
+        "3" \
+        "SELECT COUNT(*) FROM information_schema.referential_constraints WHERE constraint_schema = DATABASE() AND constraint_name IN ('fk_courses_owner', 'fk_course_memberships_course', 'fk_course_memberships_user') AND update_rule = 'RESTRICT' AND delete_rule = 'RESTRICT';"
 
     assert_scalar \
         "auth-only cascading foreign keys" \
@@ -73,23 +84,33 @@ assert_schema_contract() {
 
     assert_scalar \
         "all foreign keys" \
-        "7" \
+        "5" \
         "SELECT COUNT(*) FROM information_schema.referential_constraints WHERE constraint_schema = DATABASE();"
 
     assert_scalar \
         "named check constraints" \
-        "20" \
-        "SELECT COUNT(*) FROM information_schema.table_constraints WHERE constraint_schema = DATABASE() AND constraint_type = 'CHECK' AND constraint_name IN ('ck_users_role', 'ck_users_account_status', 'ck_users_deleted_state', 'ck_users_deletion_requested', 'ck_users_email_presence', 'ck_users_verification_state', 'ck_local_credentials_algorithm', 'ck_local_credentials_hash_format', 'ck_external_identities_provider', 'ck_external_identities_subject_not_empty', 'ck_external_identities_tenant', 'ck_courses_status', 'ck_courses_title_not_blank', 'ck_courses_code_not_blank', 'ck_courses_term_not_blank', 'ck_courses_description_length', 'ck_courses_published_state', 'ck_courses_archived_state', 'ck_applications_status', 'ck_application_reviews_decision');"
+        "19" \
+        "SELECT COUNT(*) FROM information_schema.table_constraints WHERE constraint_schema = DATABASE() AND constraint_type = 'CHECK' AND constraint_name IN ('ck_users_role', 'ck_users_account_status', 'ck_users_deleted_state', 'ck_users_deletion_requested', 'ck_users_email_presence', 'ck_users_verification_state', 'ck_local_credentials_algorithm', 'ck_local_credentials_hash_format', 'ck_external_identities_provider', 'ck_external_identities_subject_not_empty', 'ck_external_identities_tenant', 'ck_courses_status', 'ck_courses_title_not_blank', 'ck_courses_code_not_blank', 'ck_courses_term_not_blank', 'ck_courses_description_length', 'ck_courses_published_state', 'ck_courses_archived_state', 'ck_course_memberships_role');"
 
     assert_scalar \
         "domain uniqueness constraints" \
-        "6" \
-        "SELECT COUNT(*) FROM information_schema.table_constraints WHERE constraint_schema = DATABASE() AND constraint_type = 'UNIQUE' AND constraint_name IN ('uq_users_normalized_email', 'uq_external_identities_provider_subject', 'uq_external_identities_user_provider', 'uq_courses_owner_code_term', 'uq_applications_student_course', 'uq_application_reviews_application_id');"
+        "4" \
+        "SELECT COUNT(*) FROM information_schema.table_constraints WHERE constraint_schema = DATABASE() AND constraint_type = 'UNIQUE' AND constraint_name IN ('uq_users_normalized_email', 'uq_external_identities_provider_subject', 'uq_external_identities_user_provider', 'uq_courses_owner_code_term');"
 
     assert_scalar \
         "query indexes" \
-        "7" \
-        "SELECT COUNT(DISTINCT index_name) FROM information_schema.statistics WHERE table_schema = DATABASE() AND index_name IN ('idx_users_deletion_queue', 'idx_courses_owner_status', 'idx_courses_status_created_at', 'idx_applications_student_submitted_at', 'idx_applications_course_status', 'idx_applications_status_submitted_at', 'idx_application_reviews_reviewer_reviewed_at');"
+        "5" \
+        "SELECT COUNT(DISTINCT index_name) FROM information_schema.statistics WHERE table_schema = DATABASE() AND index_name IN ('idx_users_deletion_queue', 'idx_courses_owner_status', 'idx_courses_status_created_at', 'idx_course_memberships_user_role_created', 'idx_course_memberships_course_role_created');"
+
+    # One role per user and course: the primary key is exactly (course_id, user_id).
+    assert_scalar \
+        "course membership key and index columns" \
+        "idx_course_memberships_course_role_created=course_id,role,created_at;idx_course_memberships_user_role_created=user_id,role,created_at;PRIMARY=course_id,user_id" \
+        "SELECT GROUP_CONCAT(entry ORDER BY entry SEPARATOR ';') FROM (SELECT CONCAT(index_name, '=', GROUP_CONCAT(column_name ORDER BY seq_in_index)) AS entry FROM information_schema.statistics WHERE table_schema = DATABASE() AND table_name = 'course_memberships' GROUP BY index_name) AS indexes;"
+    assert_scalar \
+        "course membership role default" \
+        "NULL" \
+        "SELECT COALESCE(column_default, 'NULL') FROM information_schema.columns WHERE table_schema = DATABASE() AND table_name = 'course_memberships' AND column_name = 'role';"
 }
 
 assert_data_contract() {
@@ -104,13 +125,6 @@ assert_data_contract() {
         VALUES (UNHEX('00000000000070008000000000000011'), UNHEX('00000000000070008000000000000001'), 'GOOGLE', 'CaseSensitiveSubject');
         INSERT INTO courses (id, owner_user_id, title, code, term, description)
         VALUES (UNHEX('00000000000070008000000000000021'), UNHEX('00000000000070008000000000000002'), 'Introduction to Computing', 'CSC101', 'Fall 2030', 'Foundational computing course');
-        INSERT INTO applications (id, student_id, course_id)
-        VALUES (UNHEX('00000000000070008000000000000031'), UNHEX('00000000000070008000000000000001'), UNHEX('00000000000070008000000000000021'));
-        UPDATE applications SET status = 'ACCEPTED' WHERE id = UNHEX('00000000000070008000000000000031');
-        INSERT INTO applications (id, student_id, course_id)
-        VALUES (UNHEX('00000000000070008000000000000035'), UNHEX('00000000000070008000000000000002'), UNHEX('00000000000070008000000000000021'));
-        INSERT INTO application_reviews (id, application_id, reviewer_id, decision, comments)
-        VALUES (UNHEX('00000000000070008000000000000041'), UNHEX('00000000000070008000000000000031'), UNHEX('00000000000070008000000000000002'), 'ACCEPTED', 'Meets the course requirements');
 
         -- An OAuth-only account linked to two providers, one of them reusing a subject string.
         INSERT INTO users (id, email, normalized_email, display_name, account_status, email_verified_at)
@@ -152,6 +166,17 @@ assert_data_contract() {
         VALUES (UNHEX('00000000000070008000000000000065'), UNHEX('00000000000070008000000000000002'), 'Termless', 'MAT200', '');
         INSERT INTO courses (id, owner_user_id, title, description)
         VALUES (UNHEX('00000000000070008000000000000066'), UNHEX('00000000000070008000000000000007'), 'Owned by OAuth user', REPEAT('d', 10000));
+
+        -- Every owner is an instructor member, as the course store guarantees. Course
+        -- roles are independent of global roles: the global STUDENT (user 1) teaches
+        -- course 61 and takes course 21, and the global ADMIN (user 2) has no role
+        -- in course 61. A tombstone and an account awaiting deletion keep memberships.
+        INSERT INTO course_memberships (course_id, user_id, role)
+        SELECT id, owner_user_id, 'INSTRUCTOR' FROM courses;
+        INSERT INTO course_memberships (course_id, user_id, role) VALUES
+            (UNHEX('00000000000070008000000000000021'), UNHEX('00000000000070008000000000000001'), 'STUDENT'),
+            (UNHEX('00000000000070008000000000000021'), UNHEX('00000000000070008000000000000008'), 'STUDENT'),
+            (UNHEX('00000000000070008000000000000064'), UNHEX('0000000000007000800000000000000A'), 'STUDENT');
     "
 
     assert_scalar \
@@ -183,9 +208,36 @@ assert_data_contract() {
         "3" \
         "SELECT COUNT(*) FROM courses WHERE code = 'csc101';"
     assert_scalar \
-        "one persisted review" \
+        "course owners holding an instructor membership" \
+        "7:0" \
+        "SELECT CONCAT(COUNT(*), ':', SUM(m.user_id IS NULL)) FROM courses c LEFT JOIN course_memberships m ON m.course_id = c.id AND m.user_id = c.owner_user_id AND m.role = 'INSTRUCTOR';"
+    assert_scalar \
+        "global and course roles of the global student" \
+        "STUDENT:INSTRUCTOR,STUDENT:STUDENT" \
+        "SELECT GROUP_CONCAT(CONCAT(u.role, ':', m.role) ORDER BY m.role) FROM course_memberships m JOIN users u ON u.id = m.user_id WHERE m.user_id = UNHEX('00000000000070008000000000000001');"
+    assert_scalar \
+        "course roles of the global admin in a course it does not belong to" \
+        "0" \
+        "SELECT COUNT(*) FROM course_memberships WHERE course_id = UNHEX('00000000000070008000000000000061') AND user_id = UNHEX('00000000000070008000000000000002');"
+    assert_scalar \
+        "membership creation time default" \
         "1" \
-        "SELECT COUNT(*) FROM application_reviews WHERE application_id = UNHEX('00000000000070008000000000000031');"
+        "SELECT TIMESTAMPDIFF(SECOND, created_at, CURRENT_TIMESTAMP(6)) BETWEEN 0 AND 600 FROM course_memberships WHERE course_id = UNHEX('00000000000070008000000000000021') AND user_id = UNHEX('00000000000070008000000000000001');"
+
+    # My Courses, rosters, and authorization can each be served by an index. These
+    # run with fixtures present so the primary-key lookup is not optimized away.
+    assert_index_candidate \
+        "a My Courses listing" \
+        "idx_course_memberships_user_role_created" \
+        "SELECT course_id FROM course_memberships WHERE user_id = UNHEX('00000000000070008000000000000001') AND role = 'STUDENT' ORDER BY created_at;"
+    assert_index_candidate \
+        "an instructor roster" \
+        "idx_course_memberships_course_role_created" \
+        "SELECT user_id FROM course_memberships WHERE course_id = UNHEX('00000000000070008000000000000021') AND role = 'INSTRUCTOR' ORDER BY created_at;"
+    assert_index_candidate \
+        "a membership authorization lookup" \
+        "PRIMARY" \
+        "SELECT role FROM course_memberships WHERE course_id = UNHEX('00000000000070008000000000000021') AND user_id = UNHEX('00000000000070008000000000000001');"
 
     # Users and lifecycle.
     expect_rejected \
@@ -271,7 +323,7 @@ assert_data_contract() {
         "an empty Microsoft tenant" \
         "INSERT INTO external_identities (id, user_id, provider, provider_subject, tenant_id) VALUES (UNHEX('00000000000070008000000000000018'), UNHEX('00000000000070008000000000000002'), 'MICROSOFT', 'tenant-subject', '');"
 
-    # Courses, applications, and reviews.
+    # Courses.
     expect_rejected \
         "an owner reusing a course code and term case-insensitively" \
         "INSERT INTO courses (id, owner_user_id, title, code, term, description) VALUES (UNHEX('00000000000070008000000000000070'), UNHEX('00000000000070008000000000000002'), 'Duplicate', 'csc101', 'fall 2030', '');"
@@ -328,9 +380,9 @@ assert_data_contract() {
         UPDATE courses SET status = 'ARCHIVED', archived_at = CURRENT_TIMESTAMP(6) WHERE id = UNHEX('00000000000070008000000000000064');
     "
     assert_scalar \
-        "applications of an archived course" \
-        "ARCHIVED:2" \
-        "SELECT CONCAT(c.status, ':', COUNT(a.id)) FROM courses c LEFT JOIN applications a ON a.course_id = c.id WHERE c.id = UNHEX('00000000000070008000000000000021') GROUP BY c.id, c.status;"
+        "memberships of an archived course" \
+        "ARCHIVED:3" \
+        "SELECT CONCAT(c.status, ':', COUNT(m.user_id)) FROM courses c LEFT JOIN course_memberships m ON m.course_id = c.id WHERE c.id = UNHEX('00000000000070008000000000000021') GROUP BY c.id, c.status;"
     mysql_query "UPDATE courses SET status = 'PUBLISHED', archived_at = NULL WHERE id = UNHEX('00000000000070008000000000000021');"
     assert_scalar \
         "a restored course keeps its first publication time" \
@@ -339,30 +391,48 @@ assert_data_contract() {
     expect_rejected \
         "an owner reusing an archived course's code and term" \
         "INSERT INTO courses (id, owner_user_id, title, code, term, description) VALUES (UNHEX('00000000000070008000000000000079'), UNHEX('00000000000070008000000000000002'), 'Reuse', 'CSC101', 'Winter 2031', '');"
+    assert_scalar \
+        "memberships of a restored course" \
+        "3" \
+        "SELECT COUNT(*) FROM course_memberships WHERE course_id = UNHEX('00000000000070008000000000000021');"
+
+    # Course memberships.
     expect_rejected \
-        "a duplicate student-course application" \
-        "INSERT INTO applications (id, student_id, course_id) VALUES (UNHEX('00000000000070008000000000000032'), UNHEX('00000000000070008000000000000001'), UNHEX('00000000000070008000000000000021'));"
+        "a duplicate membership with the same role" \
+        "INSERT INTO course_memberships (course_id, user_id, role) VALUES (UNHEX('00000000000070008000000000000021'), UNHEX('00000000000070008000000000000001'), 'STUDENT');"
     expect_rejected \
-        "an invalid application status" \
-        "UPDATE applications SET status = 'WAITLISTED' WHERE id = UNHEX('00000000000070008000000000000035');"
+        "a second membership with a different role" \
+        "INSERT INTO course_memberships (course_id, user_id, role) VALUES (UNHEX('00000000000070008000000000000021'), UNHEX('00000000000070008000000000000001'), 'INSTRUCTOR');"
     expect_rejected \
-        "a non-canonical application status" \
-        "UPDATE applications SET status = 'pending' WHERE id = UNHEX('00000000000070008000000000000035');"
+        "a membership of an unknown course" \
+        "INSERT INTO course_memberships (course_id, user_id, role) VALUES (UNHEX('00000000000070008000000000000099'), UNHEX('00000000000070008000000000000001'), 'STUDENT');"
     expect_rejected \
-        "an application for an unknown student" \
-        "INSERT INTO applications (id, student_id, course_id) VALUES (UNHEX('00000000000070008000000000000034'), UNHEX('00000000000070008000000000000099'), UNHEX('00000000000070008000000000000021'));"
+        "a membership for an unknown user" \
+        "INSERT INTO course_memberships (course_id, user_id, role) VALUES (UNHEX('00000000000070008000000000000021'), UNHEX('00000000000070008000000000000099'), 'STUDENT');"
     expect_rejected \
-        "a second final review" \
-        "INSERT INTO application_reviews (id, application_id, reviewer_id, decision) VALUES (UNHEX('00000000000070008000000000000042'), UNHEX('00000000000070008000000000000031'), UNHEX('00000000000070008000000000000002'), 'REJECTED');"
+        "an unsupported course role" \
+        "INSERT INTO course_memberships (course_id, user_id, role) VALUES (UNHEX('00000000000070008000000000000062'), UNHEX('00000000000070008000000000000001'), 'TA');"
     expect_rejected \
-        "an invalid review decision" \
-        "INSERT INTO application_reviews (id, application_id, reviewer_id, decision) VALUES (UNHEX('00000000000070008000000000000043'), UNHEX('00000000000070008000000000000035'), UNHEX('00000000000070008000000000000002'), 'RECONSIDER');"
+        "a non-canonical course role" \
+        "INSERT INTO course_memberships (course_id, user_id, role) VALUES (UNHEX('00000000000070008000000000000062'), UNHEX('00000000000070008000000000000001'), 'student');"
     expect_rejected \
-        "a review for an unknown application" \
-        "INSERT INTO application_reviews (id, application_id, reviewer_id, decision) VALUES (UNHEX('00000000000070008000000000000044'), UNHEX('00000000000070008000000000000099'), UNHEX('00000000000070008000000000000002'), 'REJECTED');"
+        "a global account role used as a course role" \
+        "INSERT INTO course_memberships (course_id, user_id, role) VALUES (UNHEX('00000000000070008000000000000062'), UNHEX('00000000000070008000000000000001'), 'ADMIN');"
     expect_rejected \
-        "a review by an unknown reviewer" \
-        "INSERT INTO application_reviews (id, application_id, reviewer_id, decision) VALUES (UNHEX('00000000000070008000000000000045'), UNHEX('00000000000070008000000000000035'), UNHEX('00000000000070008000000000000099'), 'REJECTED');"
+        "a NULL course role" \
+        "INSERT INTO course_memberships (course_id, user_id, role) VALUES (UNHEX('00000000000070008000000000000062'), UNHEX('00000000000070008000000000000001'), NULL);"
+    expect_rejected \
+        "a membership without a role" \
+        "INSERT INTO course_memberships (course_id, user_id) VALUES (UNHEX('00000000000070008000000000000062'), UNHEX('00000000000070008000000000000001'));"
+    expect_rejected \
+        "moving a membership to an unknown course" \
+        "UPDATE course_memberships SET course_id = UNHEX('00000000000070008000000000000099') WHERE course_id = UNHEX('00000000000070008000000000000021') AND user_id = UNHEX('00000000000070008000000000000001');"
+    expect_rejected \
+        "moving a membership to an unknown user" \
+        "UPDATE course_memberships SET user_id = UNHEX('00000000000070008000000000000099') WHERE course_id = UNHEX('00000000000070008000000000000021') AND user_id = UNHEX('00000000000070008000000000000001');"
+    expect_rejected \
+        "changing a referenced course id" \
+        "UPDATE courses SET id = UNHEX('00000000000070008000000000000098') WHERE id = UNHEX('00000000000070008000000000000066');"
 
     # Deletion and foreign-key integrity.
     expect_rejected \
@@ -389,8 +459,26 @@ assert_data_contract() {
         "hard deletion of a referenced course" \
         "DELETE FROM courses WHERE id = UNHEX('00000000000070008000000000000021');"
     expect_rejected \
-        "hard deletion of a reviewed application" \
-        "DELETE FROM applications WHERE id = UNHEX('00000000000070008000000000000031');"
+        "hard deletion of a course whose only member is its owner" \
+        "DELETE FROM courses WHERE id = UNHEX('00000000000070008000000000000062');"
+    expect_rejected \
+        "hard deletion of a tombstoned member" \
+        "DELETE FROM users WHERE id = UNHEX('00000000000070008000000000000008');"
+
+    # Account changes leave course memberships intact: anonymizing a member
+    # (AUTH-12) keeps the row, and a global role change does not alter course roles.
+    mysql_query "
+        UPDATE users SET account_status = 'DELETED', deleted_at = CURRENT_TIMESTAMP(6), email = NULL, normalized_email = NULL, display_name = 'Deleted user' WHERE id = UNHEX('0000000000007000800000000000000A');
+        UPDATE users SET role = 'ADMIN' WHERE id = UNHEX('00000000000070008000000000000007');
+    "
+    assert_scalar \
+        "the membership of an anonymized member" \
+        "DELETED:STUDENT" \
+        "SELECT CONCAT(u.account_status, ':', m.role) FROM course_memberships m JOIN users u ON u.id = m.user_id WHERE m.course_id = UNHEX('00000000000070008000000000000064') AND m.user_id = UNHEX('0000000000007000800000000000000A');"
+    assert_scalar \
+        "the course role of a member whose global role changed" \
+        "ADMIN:INSTRUCTOR" \
+        "SELECT CONCAT(u.role, ':', m.role) FROM course_memberships m JOIN users u ON u.id = m.user_id WHERE m.course_id = UNHEX('00000000000070008000000000000066') AND m.user_id = UNHEX('00000000000070008000000000000007');"
 
     mysql_query "DELETE FROM users WHERE id = UNHEX('0000000000007000800000000000000B');"
     assert_scalar \

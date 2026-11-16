@@ -4,3 +4,4 @@
 //! response models and decide explicitly which fields are public.
 
 pub(crate) mod course;
+pub(crate) mod course_membership;

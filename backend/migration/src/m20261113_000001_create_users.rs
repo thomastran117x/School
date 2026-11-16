@@ -3,7 +3,7 @@
 //! Credentials live in `local_credentials` and federated logins in
 //! `external_identities`, so a user row never holds secret material. A deleted
 //! account is kept as an anonymized tombstone (both email columns `NULL`) so
-//! historical applications and reviews keep their foreign keys.
+//! owned courses and course memberships keep their foreign keys.
 
 use sea_orm_migration::prelude::*;
 

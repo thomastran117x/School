@@ -111,6 +111,11 @@ docker compose up \
 echo "Checking the complete SeaORM migration lifecycle."
 bash scripts/test-migrations.sh
 
+echo "Checking course creation, membership constraints, and concurrent membership writes."
+cargo test --locked -p backend-api --bin backend-api \
+    features::courses::store::tests::integration:: \
+    -- --ignored
+
 echo "Checking MySQL connectivity, query deadlines, and pool exhaustion."
 cargo test --locked -p backend-api --bin backend-api \
     infrastructure::database::tests::mysql_pool_enforces_tls_and_timeouts \
