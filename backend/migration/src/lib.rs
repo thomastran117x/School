@@ -8,8 +8,7 @@
 mod m20261113_000001_create_users;
 mod m20261113_000002_create_external_identities;
 mod m20261113_000003_create_courses;
-mod m20261113_000004_create_applications;
-mod m20261113_000005_create_application_reviews;
+mod m20261113_000004_create_course_memberships;
 mod m20261115_000006_create_local_credentials;
 
 use async_trait::async_trait;
@@ -26,8 +25,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20261113_000001_create_users::Migration),
             Box::new(m20261113_000002_create_external_identities::Migration),
             Box::new(m20261113_000003_create_courses::Migration),
-            Box::new(m20261113_000004_create_applications::Migration),
-            Box::new(m20261113_000005_create_application_reviews::Migration),
+            Box::new(m20261113_000004_create_course_memberships::Migration),
             Box::new(m20261115_000006_create_local_credentials::Migration),
         ]
     }

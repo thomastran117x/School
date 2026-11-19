@@ -40,6 +40,9 @@ pub struct Model {
 /// Relations from a course to other tables.
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
 pub enum Relation {
+    /// Instructors and students of the course, including the owner.
+    #[sea_orm(has_many = "super::course_membership::Entity")]
+    Memberships,
     /// The owning user.
     #[sea_orm(
         belongs_to = "user::Entity",
@@ -54,6 +57,12 @@ pub enum Relation {
 impl Related<user::Entity> for Entity {
     fn to() -> RelationDef {
         Relation::Owner.def()
+    }
+}
+
+impl Related<super::course_membership::Entity> for Entity {
+    fn to() -> RelationDef {
+        Relation::Memberships.def()
     }
 }
 

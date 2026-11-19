@@ -328,11 +328,11 @@ The Compose OpenSearch service disables its security plugin for local developmen
 
 ## Migrations
 
-The migration crate owns the authoritative MySQL schema for users, local credentials, external identities, courses, applications, and application reviews. Migrations never run implicitly during API startup; run them as an explicit release step before deploying application instances that depend on the new schema.
+The migration crate owns the authoritative MySQL schema for users, local credentials, external identities, courses, and course memberships. Migrations never run implicitly during API startup; run them as an explicit release step before deploying application instances that depend on the new schema.
 
-All primary and foreign keys use application-generated UUIDv7 values stored as `BINARY(16)`. Application timestamps are UTC `DATETIME(6)` values. The database enforces account roles and states, the course lifecycle, per-owner course code uniqueness, application and review states, unique emails, one application per student and course, one final review per application, and audit-preserving foreign keys. The identity tables are described in [Identity schema](#identity-schema), and courses in [Course schema](#course-schema).
+All primary and foreign keys use application-generated UUIDv7 values stored as `BINARY(16)`. Application timestamps are UTC `DATETIME(6)` values. The database enforces account roles and states, the course lifecycle, per-owner course code uniqueness, course roles, unique emails, one membership per user and course, and audit-preserving foreign keys. The identity tables are described in [Identity schema](#identity-schema), courses in [Course schema](#course-schema), and memberships in [Course membership schema](#course-membership-schema).
 
-> **Schema rewrites.** Migrations `000001_create_users`, `000002_create_external_identities`, and `000003_create_courses` were rewritten in place, and `000006_create_local_credentials` was added. A local database that applied the earlier versions must be rebuilt with `cargo run -p migration -- fresh`. Do this only against a disposable development database, because it drops all data.
+> **Schema rewrites.** Migrations `000001_create_users`, `000002_create_external_identities`, and `000003_create_courses` were rewritten in place, and `000006_create_local_credentials` was added. The legacy application workflow was then removed: `000004_create_applications` was replaced by `000004_create_course_memberships`, and `000005_create_application_reviews` was deleted. A local database that applied the earlier versions must be rebuilt with `cargo run -p migration -- fresh`. Do this only against a disposable development database, because it drops all data.
 
 ### Identity schema
 
@@ -359,9 +359,9 @@ A user with no `local_credentials` row is OAuth-only. `users` holds no secret ma
 
 **Deletion and retention (AUTH-12).**
 
-- `applications` and `application_reviews` reference `users` with `RESTRICT`, so a user with history is never hard-deleted.
+- `courses` (owner) and `course_memberships` reference `users` with `RESTRICT`, so a user with history is never hard-deleted.
 - Deletion runs in one transaction. It sets `DELETED` and `deleted_at`, clears both email columns (which frees the address for a new signup), replaces `display_name`, and deletes the user's `local_credentials` and `external_identities` rows.
-- Applications and reviews are retained and still point to the tombstone.
+- Owned courses and course memberships are retained and still point to the tombstone.
 - An account with no history, such as a never-verified signup, may be hard-deleted. The `CASCADE` foreign keys then remove its credential and identity rows. These cascades are limited to auth-only tables that have no dependents.
 
 **Roles.** No API path creates or elevates `ADMIN`. Administrators are provisioned out-of-band. Signup must build its insert from `NewStudentAccount` and reject unknown request fields.
@@ -376,7 +376,7 @@ A user with no `local_credentials` row is OAuth-only. `users` holds no secret ma
 
 ### Course schema
 
-A course is a learning course owned by a user, not an application-only offering. The legacy `applications` and `application_reviews` tables still reference `courses.id`, but new course features must not build on that workflow.
+A course is a learning course owned by a user, not an application-only offering. Who teaches or takes a course is recorded in [`course_memberships`](#course-membership-schema); there is no application workflow.
 
 | Column | Type | Rules |
 | --- | --- | --- |
@@ -417,6 +417,41 @@ Indexes: `idx_courses_owner_status (owner_user_id, status, created_at)` serves "
 
 **Future extensions.** Application deadlines, seat capacity, and enrollment policy are intentionally absent from the initial LMS. If they are needed, add them through a forward migration, either as nullable columns or a separate enrollment-policy table, and do not revive the legacy application workflow.
 
+### Course membership schema
+
+`course_memberships` records who belongs to a course and in what role. It replaces the legacy `applications` and `application_reviews` tables.
+
+| Column | Type | Rules |
+| --- | --- | --- |
+| `course_id` | `BINARY(16)` | FK `fk_course_memberships_course` → `courses.id`, `ON UPDATE RESTRICT ON DELETE RESTRICT` |
+| `user_id` | `BINARY(16)` | FK `fk_course_memberships_user` → `users.id`, `ON UPDATE RESTRICT ON DELETE RESTRICT` |
+| `role` | `VARCHAR(16)` | `INSTRUCTOR` or `STUDENT` (`ck_course_memberships_role`); required, no default |
+| `created_at` | `DATETIME(6)` | Maintained by MySQL |
+
+The primary key `pk_course_memberships (course_id, user_id)` is the uniqueness rule: a user holds at most one role per course, so changing a role updates the row instead of adding one. There is no surrogate ID.
+
+| Access path | Served by |
+| --- | --- |
+| Membership authorization (`course_id` and `user_id`) | Primary-key point lookup |
+| My Courses: all, teaching, or enrolled (`user_id`, optional `role`, by `created_at`) | `idx_course_memberships_user_role_created (user_id, role, created_at)`, which also covers the user FK |
+| Instructor or student roster (`course_id`, `role`, by `created_at`) | `idx_course_memberships_course_role_created (course_id, role, created_at)` |
+
+InnoDB appends the primary key to secondary indexes, so both listings can join to `courses` or `users` without reading the membership rows.
+
+**Course roles and global roles are distinct.** `users.role` (`STUDENT`/`ADMIN`) is an account-wide role. `course_memberships.role` applies to one course only. A globally `STUDENT` account can be the `INSTRUCTOR` of a course it owns, and an `ADMIN` has no course role unless it is a member. In Rust, `CourseRole` and `identity::Role` are separate enums with no conversion between them, and a global role change never touches memberships.
+
+**Owner invariant.** The owner of a course always holds an `INSTRUCTOR` membership of it. The schema cannot express this rule without circular foreign keys or triggers, and the project uses neither. `features/courses/store.rs` enforces it instead:
+
+- `create_course` inserts the course and the owner's `INSTRUCTOR` membership in one transaction. If either insert fails, nothing is written.
+- `change_member_role` and `remove_member` refuse to demote or remove the owner (`OwnerMustRemainInstructor`).
+- `transfer_ownership` first makes the new owner an `INSTRUCTOR`, inserting a membership or promoting a `STUDENT`, then updates `courses.owner_user_id`. The previous owner stays an `INSTRUCTOR` until removed separately.
+
+Course writes must go through these functions. Any other path that writes `courses.owner_user_id` or the owner's membership must keep the invariant.
+
+**Concurrency.** Every store operation that reads the owner first locks the course row with `SELECT … FOR UPDATE`, so ownership and membership changes to one course are serialized. `add_member` takes no lock: the primary key decides concurrent duplicates, exactly one insert succeeds, and the others return `AlreadyMember` whatever role they requested. Unique and foreign-key violations map to typed `MembershipError` values. Each store function returns `Result<Result<T, MembershipError>, DbErr>` so callers can run it through `DatabaseClient::run` and keep its deadline and sanitized errors.
+
+**Retention.** Archiving and restoring a course leave its memberships untouched. A course or user that has memberships cannot be hard-deleted, and IDs cannot be changed while referenced. Account anonymization (AUTH-12) keeps the member's rows, which then point to the tombstone.
+
 For local development, apply and inspect migrations with:
 
 ```powershell
@@ -444,7 +479,7 @@ Prefer a forward corrective migration after a release has reached a shared envir
 
 Use `migration reset`, `migration refresh`, and `migration fresh` only against disposable local or CI databases. MySQL commits data-definition statements implicitly. If a migration fails, inspect `migration status` and the actual schema before retrying. Do not expect API restarts to repair the schema. For an ambiguous or destructive partial failure, stop deployment and restore the verified backup or ship a reviewed corrective migration.
 
-The migration contract test uses the isolated Compose database to exercise clean apply, idempotent reapply, constraints, full rollback, and reapplication:
+The migration contract test uses the isolated Compose database to exercise clean apply, idempotent reapply, constraints, index coverage, full rollback, and reapplication. `scripts/integration-test.sh` also runs the MySQL-backed course store tests, which cover transactional course creation, membership constraints, concurrent duplicate memberships, and ownership transfer racing member removal:
 
 ```bash
 bash scripts/test-migrations.sh
